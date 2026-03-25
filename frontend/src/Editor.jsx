@@ -3,8 +3,8 @@ import socket from "./socket";
 import Canvas from "./Canvas";
 
 export default function Editor({ user, project: initialProject, onBack }) {
-  const [project, setProject] = useState(initialProject);
-  const [activeFileId, setActiveFileId] = useState(() => Object.keys(initialProject.files)[0]);
+  const [project, setProject] = useState(null);
+  const [activeFileId, setActiveFileId] = useState(null);
   const [locks, setLocks] = useState({});    // fileId -> { userId, userName, color }
   const [activeUsers, setActiveUsers] = useState([]);
   const [myColor, setMyColor] = useState("#6366f1");
@@ -23,13 +23,14 @@ export default function Editor({ user, project: initialProject, onBack }) {
     socket.emit("join_project", {
       userId: user.userId,
       userName: user.userName,
-      projectId: project.id,
+      projectId: initialProject.id,
     });
 
     socket.on("init_state", ({ project: p, locks: l, color }) => {
       setProject(p);
       setLocks(l);
       setMyColor(color);
+      setActiveFileId(Object.keys(p.files)[0]);
     });
 
     socket.on("users_update", (users) => setActiveUsers(users));
@@ -87,7 +88,7 @@ export default function Editor({ user, project: initialProject, onBack }) {
       socket.off("shape_deleted");
       socket.off("file_added");
     };
-  }, [project.id, user.userId, user.userName, toast]);
+  }, [initialProject.id, user.userId, user.userName, toast]);
 
   // ── Lock helpers ─────────────────────────────────────────────────────────
   const activeLock = locks[activeFileId];
@@ -129,121 +130,129 @@ export default function Editor({ user, project: initialProject, onBack }) {
 
   function addPage() {
     const name = `Page ${Object.keys(project.files).length + 1}`;
-    socket.emit("add_file", { projectId: project.id, fileName: name });
+    socket.emit("add_file", { projectId: initialProject.id, fileName: name });
   }
 
-  const files = Object.values(project.files);
-  const activeShapes = project.files[activeFileId]?.shapes ?? [];
+  const files = project ? Object.values(project.files) : [];
+  const activeShapes = project?.files[activeFileId]?.shapes ?? [];
+
+  if (!project || !activeFileId) {
+    return (
+        <div style={{ height: "100vh", display: "flex", alignItems: "center", justifyContent: "center", background: "#0f172a", color: "#64748b", fontSize: 14 }}>
+          Connecting…
+        </div>
+    );
+  }
 
   return (
-    <div className="editor-bg">
-      {/* ── Topbar ── */}
-      <div className="topbar">
-        <div className="top-left">
-          <button className="btn-ghost" onClick={onBack}>← Back</button>
-          <span className="project-title">✦ {project.name}</span>
-        </div>
+      <div className="editor-bg">
+        {/* ── Topbar ── */}
+        <div className="topbar">
+          <div className="top-left">
+            <button className="btn-ghost" onClick={onBack}>← Back</button>
+            <span className="project-title">✦ {project.name}</span>
+          </div>
 
-        <div className="file-tabs">
-          {files.map(f => (
-            <div
-              key={f.id}
-              className={`file-tab ${f.id === activeFileId ? "active" : ""}`}
-              onClick={() => { releaseLock(); setActiveFileId(f.id); }}
-            >
-              {f.name}
-              {locks[f.id] && (
-                <span className="tab-lock" style={{ color: locks[f.id].color }} title={`${locks[f.id].userName} editing`}>
+          <div className="file-tabs">
+            {files.map(f => (
+                <div
+                    key={f.id}
+                    className={`file-tab ${f.id === activeFileId ? "active" : ""}`}
+                    onClick={() => { releaseLock(); setActiveFileId(f.id); }}
+                >
+                  {f.name}
+                  {locks[f.id] && (
+                      <span className="tab-lock" style={{ color: locks[f.id].color }} title={`${locks[f.id].userName} editing`}>
                   🔒
                 </span>
-              )}
-            </div>
-          ))}
-          <div className="file-tab add-tab" onClick={addPage}>+</div>
-        </div>
-
-        <div className="top-right">
-          <div className="active-users">
-            {activeUsers.map(u => (
-              <div key={u.userId} className="user-badge" style={{ background: u.color }} title={u.userName}>
-                {u.userName[0].toUpperCase()}
-              </div>
+                  )}
+                </div>
             ))}
+            <div className="file-tab add-tab" onClick={addPage}>+</div>
+          </div>
+
+          <div className="top-right">
+            <div className="active-users">
+              {activeUsers.map(u => (
+                  <div key={u.userId} className="user-badge" style={{ background: u.color }} title={u.userName}>
+                    {u.userName[0].toUpperCase()}
+                  </div>
+              ))}
+            </div>
           </div>
         </div>
-      </div>
 
-      {/* ── Lock banner ── */}
-      {lockedByOther && (
-        <div className="lock-banner" style={{ borderColor: activeLock.color, background: activeLock.color + "18" }}>
-          <span>🔒</span>
-          <span><strong>{activeLock.userName}</strong> is editing — you are in view-only mode</span>
-        </div>
-      )}
-      {iHaveLock && (
-        <div className="my-lock-banner">
-          <span>🔏 You have the edit lock</span>
-          <button className="btn-release" onClick={releaseLock}>Release</button>
-        </div>
-      )}
+        {/* ── Lock banner ── */}
+        {lockedByOther && (
+            <div className="lock-banner" style={{ borderColor: activeLock.color, background: activeLock.color + "18" }}>
+              <span>🔒</span>
+              <span><strong>{activeLock.userName}</strong> is editing — you are in view-only mode</span>
+            </div>
+        )}
+        {iHaveLock && (
+            <div className="my-lock-banner">
+              <span>🔏 You have the edit lock</span>
+              <button className="btn-release" onClick={releaseLock}>Release</button>
+            </div>
+        )}
 
-      {/* ── Editor body ── */}
-      <div className="editor-body">
-        {/* Toolbar */}
-        <div className="toolbar">
-          {[
-            { id: "select",  icon: "↖", label: "Select / Move" },
-            { id: "rect",    icon: "▭", label: "Rectangle" },
-            { id: "ellipse", icon: "○", label: "Ellipse" },
-            { id: "diamond", icon: "◇", label: "Diamond" },
-            { id: "line",    icon: "╱", label: "Line" },
-            { id: "text",    icon: "T", label: "Text" },
-            { id: "delete",  icon: "🗑", label: "Delete shape" },
-          ].map(t => (
-            <button
-              key={t.id}
-              title={t.label}
-              className={`tool-btn ${tool === t.id ? "active" : ""}`}
-              onClick={() => setTool(t.id)}
-            >
-              {t.icon}
-            </button>
-          ))}
+        {/* ── Editor body ── */}
+        <div className="editor-body">
+          {/* Toolbar */}
+          <div className="toolbar">
+            {[
+              { id: "select",  icon: "↖", label: "Select / Move" },
+              { id: "rect",    icon: "▭", label: "Rectangle" },
+              { id: "ellipse", icon: "○", label: "Ellipse" },
+              { id: "diamond", icon: "◇", label: "Diamond" },
+              { id: "line",    icon: "╱", label: "Line" },
+              { id: "text",    icon: "T", label: "Text" },
+              { id: "delete",  icon: "🗑", label: "Delete shape" },
+            ].map(t => (
+                <button
+                    key={t.id}
+                    title={t.label}
+                    className={`tool-btn ${tool === t.id ? "active" : ""}`}
+                    onClick={() => setTool(t.id)}
+                >
+                  {t.icon}
+                </button>
+            ))}
+          </div>
+
+          {/* Canvas */}
+          <div className="canvas-wrap">
+            <Canvas
+                shapes={activeShapes}
+                tool={tool}
+                myColor={myColor}
+                locked={lockedByOther}
+                onShapeAdd={handleShapeAdd}
+                onShapeUpdate={handleShapeUpdate}
+                onShapeDelete={handleShapeDelete}
+            />
+          </div>
         </div>
 
-        {/* Canvas */}
-        <div className="canvas-wrap">
-          <Canvas
-            shapes={activeShapes}
-            tool={tool}
-            myColor={myColor}
-            locked={lockedByOther}
-            onShapeAdd={handleShapeAdd}
-            onShapeUpdate={handleShapeUpdate}
-            onShapeDelete={handleShapeDelete}
-          />
-        </div>
-      </div>
-
-      {/* ── Status bar ── */}
-      <div className="status-bar">
+        {/* ── Status bar ── */}
+        <div className="status-bar">
         <span>
           {lockedByOther
-            ? `🔒 ${activeLock.userName} is editing`
-            : iHaveLock
-            ? "🔏 You are editing"
-            : "Click a tool and draw to start — lock auto-acquired"}
+              ? `🔒 ${activeLock.userName} is editing`
+              : iHaveLock
+                  ? "🔏 You are editing"
+                  : "Click a tool and draw to start — lock auto-acquired"}
         </span>
-        <span className="status-right">
+          <span className="status-right">
           {activeUsers.length} user{activeUsers.length !== 1 ? "s" : ""} online
         </span>
-      </div>
+        </div>
 
-      {/* ── Toasts ── */}
-      <div className="toast-stack">
-        {toasts.map(t => <div key={t.id} className="toast">{t.msg}</div>)}
+        {/* ── Toasts ── */}
+        <div className="toast-stack">
+          {toasts.map(t => <div key={t.id} className="toast">{t.msg}</div>)}
+        </div>
       </div>
-    </div>
   );
 }
 
