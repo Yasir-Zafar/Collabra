@@ -41,8 +41,8 @@ projects[DEMO_ID] = {
 
 function usersInProject(projectId) {
   return Object.values(sessions)
-    .filter(s => s.projectId === projectId)
-    .map(s => ({ userId: s.userId, userName: s.userName, color: s.color }));
+      .filter(s => s.projectId === projectId)
+      .map(s => ({ userId: s.userId, userName: s.userName, color: s.color }));
 }
 
 // ── REST ─────────────────────────────────────────────────────────────────
@@ -135,6 +135,15 @@ io.on("connection", (socket) => {
     if (!file) return;
     file.shapes = file.shapes.filter(s => s.id !== shapeId);
     socket.to(session.projectId).emit("shape_deleted", { fileId, shapeId });
+  });
+
+  socket.on("snapshot", ({ fileId, shapes }) => {
+    const session = sessions[socket.id];
+    if (!session || locks[fileId]?.socketId !== socket.id) return;
+    const file = projects[session.projectId]?.files[fileId];
+    if (!file) return;
+    file.shapes = shapes;
+    socket.to(session.projectId).emit("snapshot", { fileId, shapes });
   });
 
   socket.on("add_file", ({ projectId, fileName }) => {

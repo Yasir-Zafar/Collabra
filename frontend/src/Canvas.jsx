@@ -1,188 +1,353 @@
-import { useRef, useState } from "react";
-import { v4 as uuidv4 } from "uuid";
+import { useState, useEffect, useCallback, useRef } from "react";
+import socket from "./socket";
+import Canvas from "./Canvas";
 
-export default function Canvas({ shapes, tool, onShapeAdd, onShapeUpdate, onShapeDelete, locked, myColor }) {
-  const svgRef = useRef(null);
-  const [selected, setSelected] = useState(null);
-  const [dragging, setDragging] = useState(null);   // { shapeId, ox, oy }
-  const [drawing, setDrawing] = useState(null);     // { shape, startX, startY }
+const PRESET_COLORS = ["#6366f1","#ef4444","#f59e0b","#10b981","#3b82f6","#ec4899","#1e293b","#ffffff"];
 
-  function getPos(e) {
-    const rect = svgRef.current.getBoundingClientRect();
-    return { x: e.clientX - rect.left, y: e.clientY - rect.top };
+export default function Editor({ user, project: initialProject, onBack }) {
+  const [project, setProject]         = useState(null);
+  const [activeFileId, setActiveFileId] = useState(null);
+  const [locks, setLocks]             = useState({});
+  const [activeUsers, setActiveUsers] = useState([]);
+  const [tool, setTool]               = useState("select");
+  const [fillColor, setFillColor]     = useState("#6366f1");
+  const [toasts, setToasts]           = useState([]);
+  const toastId   = useRef(0);
+  const historyRef = useRef({}); // { [fileId]: { past: snapshots[], future: snapshots[] } }
+
+  function getHistory(fileId) {
+    if (!historyRef.current[fileId]) historyRef.current[fileId] = { past: [], future: [] };
+    return historyRef.current[fileId];
   }
 
-  function hitTest(pos) {
-    for (let i = shapes.length - 1; i >= 0; i--) {
-      const s = shapes[i];
-      if (s.type === "rect" || s.type === "diamond") {
-        if (pos.x >= s.x && pos.x <= s.x + s.w && pos.y >= s.y && pos.y <= s.y + s.h) return s.id;
-      } else if (s.type === "ellipse") {
-        const dx = (pos.x - s.cx) / s.rx;
-        const dy = (pos.y - s.cy) / s.ry;
-        if (dx * dx + dy * dy <= 1) return s.id;
-      } else if (s.type === "line") {
-        const d = ptSegDist(pos, { x: s.x1, y: s.y1 }, { x: s.x2, y: s.y2 });
-        if (d < 8) return s.id;
-      } else if (s.type === "text") {
-        if (pos.x >= s.x && pos.x <= s.x + 200 && pos.y >= s.y - s.fontSize && pos.y <= s.y + 6) return s.id;
-      }
+  const toast = useCallback((msg) => {
+    const id = ++toastId.current;
+    setToasts(t => [...t, { id, msg }]);
+    setTimeout(() => setToasts(t => t.filter(x => x.id !== id)), 3500);
+  }, []);
+
+  // ── Socket setup ──────────────────────────────────────────────────────────
+  useEffect(() => {
+    socket.emit("join_project", {
+      userId: user.userId,
+      userName: user.userName,
+      projectId: initialProject.id,
+    });
+
+    socket.on("init_state", ({ project: p, locks: l }) => {
+      setProject(p);
+      setLocks(l);
+      setActiveFileId(Object.keys(p.files)[0]);
+    });
+
+    socket.on("users_update", (users) => setActiveUsers(users));
+    socket.on("user_joined",  ({ userName }) => toast(`${userName} joined`));
+    socket.on("user_left",    ({ userId })   => setActiveUsers(u => u.filter(x => x.userId !== userId)));
+
+    socket.on("lock_acquired", ({ fileId, userId, userName, color }) => {
+      setLocks(l => ({ ...l, [fileId]: { userId, userName, color } }));
+      if (userId !== user.userId) toast(`${userName} started editing`);
+    });
+
+    socket.on("lock_released", ({ fileId }) => {
+      setLocks(l => {
+        const prev = l[fileId];
+        if (prev && prev.userId !== user.userId) toast(`${prev.userName} finished editing`);
+        const next = { ...l }; delete next[fileId]; return next;
+      });
+    });
+
+    socket.on("lock_denied",   ({ lockedBy }) => toast(`${lockedBy} is editing — please wait`));
+    socket.on("shape_added",   ({ fileId, shape })            => setProject(p => addShape(p, fileId, shape)));
+    socket.on("shape_updated", ({ fileId, shapeId, changes }) => setProject(p => updateShape(p, fileId, shapeId, changes)));
+    socket.on("shape_deleted", ({ fileId, shapeId })          => setProject(p => deleteShape(p, fileId, shapeId)));
+    socket.on("snapshot",      ({ fileId, shapes })           => setProject(p => setShapes(p, fileId, shapes)));
+    socket.on("file_added",    ({ file })                     => setProject(p => ({ ...p, files: { ...p.files, [file.id]: file } })));
+
+    return () => {
+      ["init_state","users_update","user_joined","user_left","lock_acquired","lock_released",
+        "lock_denied","shape_added","shape_updated","shape_deleted","snapshot","file_added"]
+          .forEach(ev => socket.off(ev));
+    };
+  }, [initialProject.id, user.userId, user.userName, toast]);
+
+  // ── Undo/redo keybinds ────────────────────────────────────────────────────
+  useEffect(() => {
+    function onKey(e) {
+      const mod = e.ctrlKey || e.metaKey;
+      if (!mod) return;
+      if (e.key === "z" && !e.shiftKey) { e.preventDefault(); doUndo(); }
+      if ((e.key === "z" && e.shiftKey) || e.key === "y") { e.preventDefault(); doRedo(); }
     }
-    return null;
+    window.addEventListener("keydown", onKey);
+    return () => window.removeEventListener("keydown", onKey);
+  }); // no dep array — always captures latest iHaveLock/project
+
+  // ── Lock helpers ──────────────────────────────────────────────────────────
+  const activeLock    = locks[activeFileId];
+  const iHaveLock     = activeLock?.userId === user.userId;
+  const lockedByOther = !!(activeLock && activeLock.userId !== user.userId);
+
+  function tryAcquireLock() {
+    if (iHaveLock) return true;
+    if (lockedByOther) { toast(`${activeLock.userName} is editing — please wait`); return false; }
+    socket.emit("acquire_lock", { fileId: activeFileId });
+    return true;
   }
 
-  function ptSegDist(p, a, b) {
-    const dx = b.x - a.x, dy = b.y - a.y;
-    const len2 = dx * dx + dy * dy;
-    const t = len2 === 0 ? 0 : Math.max(0, Math.min(1, ((p.x - a.x) * dx + (p.y - a.y) * dy) / len2));
-    return Math.hypot(p.x - a.x - t * dx, p.y - a.y - t * dy);
+  function releaseLock() { socket.emit("release_lock", { fileId: activeFileId }); }
+
+  // ── History ───────────────────────────────────────────────────────────────
+  function snapshotBefore() {
+    if (!project || !activeFileId) return;
+    const shapes = project.files[activeFileId]?.shapes ?? [];
+    const h = getHistory(activeFileId);
+    h.past.push(JSON.parse(JSON.stringify(shapes)));
+    if (h.past.length > 50) h.past.shift();
+    h.future = [];
   }
 
-  function onMouseDown(e) {
-    if (locked) return;
-    const pos = getPos(e);
-
-    if (tool === "select") {
-      const hit = hitTest(pos);
-      setSelected(hit);
-      if (hit) {
-        const s = shapes.find(x => x.id === hit);
-        const ox = pos.x - (s.x ?? s.cx ?? s.x1);
-        const oy = pos.y - (s.y ?? s.cy ?? s.y1);
-        setDragging({ shapeId: hit, ox, oy });
-      }
-      return;
-    }
-
-    if (tool === "delete") {
-      const hit = hitTest(pos);
-      if (hit) onShapeDelete(hit);
-      return;
-    }
-
-    // Start drawing a new shape
-    let shape;
-    if (tool === "rect") {
-      shape = { id: uuidv4(), type: "rect", x: pos.x, y: pos.y, w: 2, h: 2, fill: myColor, stroke: "#1e293b", sw: 2 };
-    } else if (tool === "ellipse") {
-      shape = { id: uuidv4(), type: "ellipse", cx: pos.x, cy: pos.y, rx: 2, ry: 2, fill: myColor, stroke: "#1e293b", sw: 2 };
-    } else if (tool === "line") {
-      shape = { id: uuidv4(), type: "line", x1: pos.x, y1: pos.y, x2: pos.x, y2: pos.y, stroke: myColor, sw: 3 };
-    } else if (tool === "diamond") {
-      shape = { id: uuidv4(), type: "diamond", x: pos.x, y: pos.y, w: 2, h: 2, fill: myColor, stroke: "#1e293b", sw: 2 };
-    } else if (tool === "text") {
-      const text = window.prompt("Enter text:", "Label");
-      if (text) {
-        const shape = { id: uuidv4(), type: "text", x: pos.x, y: pos.y, text, fontSize: 20, fill: myColor };
-        onShapeAdd(shape);
-      }
-      return;
-    }
-    if (shape) setDrawing({ shape, startX: pos.x, startY: pos.y });
+  function doUndo() {
+    if (!iHaveLock || !project || !activeFileId) return;
+    const h = getHistory(activeFileId);
+    if (!h.past.length) return;
+    const current = project.files[activeFileId]?.shapes ?? [];
+    h.future.push(JSON.parse(JSON.stringify(current)));
+    const prev = h.past.pop();
+    setProject(p => setShapes(p, activeFileId, prev));
+    socket.emit("snapshot", { fileId: activeFileId, shapes: prev });
   }
 
-  function onMouseMove(e) {
-    const pos = getPos(e);
-
-    if (dragging) {
-      const s = shapes.find(x => x.id === dragging.shapeId);
-      if (!s) return;
-      let changes = {};
-      if (s.type === "rect" || s.type === "diamond") {
-        changes = { x: pos.x - dragging.ox, y: pos.y - dragging.oy };
-      } else if (s.type === "ellipse") {
-        changes = { cx: pos.x - dragging.ox, cy: pos.y - dragging.oy };
-      } else if (s.type === "line") {
-        const dx = pos.x - dragging.ox - s.x1;
-        const dy = pos.y - dragging.oy - s.y1;
-        changes = { x1: s.x1 + dx, y1: s.y1 + dy, x2: s.x2 + dx, y2: s.y2 + dy };
-      } else if (s.type === "text") {
-        changes = { x: pos.x - dragging.ox, y: pos.y - dragging.oy };
-      }
-      onShapeUpdate(dragging.shapeId, changes);
-      return;
-    }
-
-    if (drawing) {
-      const { startX, startY, shape } = drawing;
-      const dx = pos.x - startX, dy = pos.y - startY;
-      let updated;
-      if (shape.type === "rect" || shape.type === "diamond") {
-        const x = dx < 0 ? pos.x : startX;
-        const y = dy < 0 ? pos.y : startY;
-        updated = { ...shape, x, y, w: Math.abs(dx) || 2, h: Math.abs(dy) || 2 };
-      } else if (shape.type === "ellipse") {
-        updated = { ...shape, rx: Math.max(2, Math.abs(dx)), ry: Math.max(2, Math.abs(dy)) };
-      } else if (shape.type === "line") {
-        updated = { ...shape, x2: pos.x, y2: pos.y };
-      }
-      setDrawing(d => ({ ...d, shape: updated }));
-    }
+  function doRedo() {
+    if (!iHaveLock || !project || !activeFileId) return;
+    const h = getHistory(activeFileId);
+    if (!h.future.length) return;
+    const current = project.files[activeFileId]?.shapes ?? [];
+    h.past.push(JSON.parse(JSON.stringify(current)));
+    const next = h.future.pop();
+    setProject(p => setShapes(p, activeFileId, next));
+    socket.emit("snapshot", { fileId: activeFileId, shapes: next });
   }
 
-  function onMouseUp() {
-    if (drawing) {
-      onShapeAdd(drawing.shape);
-      setDrawing(null);
-    }
-    if (dragging) setDragging(null);
+  // ── Shape handlers ────────────────────────────────────────────────────────
+  function handleShapeAdd(shape) {
+    if (!tryAcquireLock()) return;
+    snapshotBefore();
+    setProject(p => addShape(p, activeFileId, shape));
+    socket.emit("shape_add", { fileId: activeFileId, shape });
   }
 
-  function renderShape(s, isPreview = false) {
-    const isSel = !isPreview && s.id === selected;
-    const selStyle = isSel ? { filter: "drop-shadow(0 0 5px #6366f1)" } : {};
+  function handleShapeUpdate(shapeId, changes) {
+    if (!iHaveLock) return;
+    setProject(p => updateShape(p, activeFileId, shapeId, changes));
+    socket.emit("shape_update", { fileId: activeFileId, shapeId, changes });
+  }
 
-    if (s.type === "rect") return (
-      <rect key={s.id} x={s.x} y={s.y} width={s.w} height={s.h}
-        fill={s.fill} stroke={isSel ? "#6366f1" : s.stroke} strokeWidth={isSel ? 3 : s.sw}
-        rx={4} style={{ cursor: "move", ...selStyle }} />
+  function handleShapeMoveStart() { snapshotBefore(); }
+
+  function handleShapeDelete(shapeId) {
+    if (!iHaveLock) { toast("Acquire the lock first to delete"); return; }
+    snapshotBefore();
+    setProject(p => deleteShape(p, activeFileId, shapeId));
+    socket.emit("shape_delete", { fileId: activeFileId, shapeId });
+  }
+
+  function addPage() {
+    socket.emit("add_file", { projectId: initialProject.id, fileName: `Page ${Object.keys(project.files).length + 1}` });
+  }
+
+  function exportCanvas() {
+    const svg = document.querySelector(".canvas-svg");
+    if (!svg) return;
+    const blob = new Blob([new XMLSerializer().serializeToString(svg)], { type: "image/svg+xml" });
+    const url  = URL.createObjectURL(blob);
+    const a    = document.createElement("a");
+    a.href = url; a.download = `${project.name}.svg`; a.click();
+    URL.revokeObjectURL(url);
+  }
+
+  function handleImageUpload(e) {
+    const file = e.target.files[0];
+    if (!file || !tryAcquireLock()) return;
+    const reader = new FileReader();
+    reader.onload = ev => handleShapeAdd({ id: crypto.randomUUID(), type: "image", x: 80, y: 80, w: 200, h: 150, href: ev.target.result });
+    reader.readAsDataURL(file);
+    e.target.value = "";
+  }
+
+  // ── Render ────────────────────────────────────────────────────────────────
+  if (!project || !activeFileId) {
+    return (
+        <div style={{ height:"100vh", display:"flex", alignItems:"center", justifyContent:"center", background:"#0f172a", color:"#64748b", fontSize:14 }}>
+          Connecting…
+        </div>
     );
-    if (s.type === "diamond") {
-      const cx = s.x + s.w / 2, cy = s.y + s.h / 2;
-      const pts = `${cx},${s.y} ${s.x + s.w},${cy} ${cx},${s.y + s.h} ${s.x},${cy}`;
-      return <polygon key={s.id} points={pts} fill={s.fill}
-        stroke={isSel ? "#6366f1" : s.stroke} strokeWidth={isSel ? 3 : s.sw}
-        style={{ cursor: "move", ...selStyle }} />;
-    }
-    if (s.type === "ellipse") return (
-      <ellipse key={s.id} cx={s.cx} cy={s.cy} rx={s.rx} ry={s.ry}
-        fill={s.fill} stroke={isSel ? "#6366f1" : s.stroke} strokeWidth={isSel ? 3 : s.sw}
-        style={{ cursor: "move", ...selStyle }} />
-    );
-    if (s.type === "line") return (
-      <line key={s.id} x1={s.x1} y1={s.y1} x2={s.x2} y2={s.y2}
-        stroke={isSel ? "#6366f1" : s.stroke} strokeWidth={isSel ? 4 : s.sw}
-        strokeLinecap="round" style={{ cursor: "move", ...selStyle }} />
-    );
-    if (s.type === "text") return (
-      <text key={s.id} x={s.x} y={s.y} fontSize={s.fontSize} fill={s.fill}
-        fontFamily="system-ui,sans-serif" style={{ cursor: "move", ...selStyle }}
-        stroke={isSel ? "#6366f1" : "none"} strokeWidth={isSel ? 0.4 : 0}>
-        {s.text}
-      </text>
-    );
-    return null;
   }
 
-  const cursor = locked ? "not-allowed" : tool === "select" ? "default" : tool === "delete" ? "crosshair" : "crosshair";
+  const files        = Object.values(project.files);
+  const activeShapes = project.files[activeFileId]?.shapes ?? [];
+  const h            = getHistory(activeFileId);
+  const canUndo      = iHaveLock && h.past.length > 0;
+  const canRedo      = iHaveLock && h.future.length > 0;
 
   return (
-    <svg
-      ref={svgRef}
-      className="canvas-svg"
-      style={{ cursor }}
-      onMouseDown={onMouseDown}
-      onMouseMove={onMouseMove}
-      onMouseUp={onMouseUp}
-    >
-      <defs>
-        <pattern id="grid" width="24" height="24" patternUnits="userSpaceOnUse">
-          <path d="M 24 0 L 0 0 0 24" fill="none" stroke="#e2e8f0" strokeWidth="0.5" />
-        </pattern>
-      </defs>
-      <rect width="100%" height="100%" fill="url(#grid)" />
-      {shapes.map(s => renderShape(s))}
-      {drawing && renderShape(drawing.shape, true)}
-    </svg>
+      <div className="editor-bg">
+
+        {/* ── Topbar ── */}
+        <div className="topbar">
+          <div className="top-left">
+            <button className="btn-ghost" onClick={onBack}>← Back</button>
+            <span className="project-title">{project.name}</span>
+          </div>
+
+          <div className="file-tabs">
+            {files.map(f => (
+                <div key={f.id}
+                     className={`file-tab ${f.id === activeFileId ? "active" : ""}`}
+                     onClick={() => { releaseLock(); setActiveFileId(f.id); }}>
+                  {f.name}
+                  {locks[f.id] && (
+                      <span className="tab-lock" style={{ color: locks[f.id].color }}
+                            title={`${locks[f.id].userName} editing`}>&#11044;</span>
+                  )}
+                </div>
+            ))}
+            <div className="file-tab add-tab" onClick={addPage}>+</div>
+          </div>
+
+          <div className="top-right">
+            <button className="topbar-btn" onClick={exportCanvas}>Export SVG</button>
+            <label className="topbar-btn" style={{ cursor:"pointer" }}>
+              Add Image
+              <input type="file" accept="image/*" style={{ display:"none" }} onChange={handleImageUpload} />
+            </label>
+            <div className="top-divider" />
+            <div className="active-users">
+              {activeUsers.map(u => (
+                  <div key={u.userId} className="user-badge" style={{ background: u.color }} title={u.userName}>
+                    {u.userName[0].toUpperCase()}
+                  </div>
+              ))}
+            </div>
+          </div>
+        </div>
+
+        {/* ── Lock banners ── */}
+        {lockedByOther && (
+            <div className="lock-banner" style={{ borderColor: activeLock.color, background: activeLock.color + "18" }}>
+              <strong>{activeLock.userName}</strong>&nbsp;is editing — view only
+            </div>
+        )}
+        {iHaveLock && (
+            <div className="my-lock-banner">
+              <span>You are editing</span>
+              <button className="btn-release" onClick={releaseLock}>Release lock</button>
+            </div>
+        )}
+
+        {/* ── Editor body ── */}
+        <div className="editor-body">
+
+          {/* Toolbar */}
+          <div className="toolbar">
+            {[
+              { id:"select",  icon:"↖", label:"Select / Move" },
+              { id:"rect",    icon:"▭", label:"Rectangle" },
+              { id:"ellipse", icon:"○", label:"Ellipse" },
+              { id:"diamond", icon:"◇", label:"Diamond" },
+              { id:"line",    icon:"╱", label:"Line" },
+              { id:"text",    icon:"T", label:"Text" },
+              { id:"delete",  icon:"✕", label:"Delete shape" },
+            ].map(t => (
+                <button key={t.id} title={t.label}
+                        className={`tool-btn ${tool === t.id ? "active" : ""}`}
+                        onClick={() => setTool(t.id)}>
+                  {t.icon}
+                </button>
+            ))}
+
+            <div className="tool-sep" />
+
+            <button className="tool-btn" title="Undo (Ctrl+Z)"
+                    onClick={doUndo} style={{ opacity: canUndo ? 1 : 0.3, fontSize: 15 }}>↩</button>
+            <button className="tool-btn" title="Redo (Ctrl+Shift+Z)"
+                    onClick={doRedo} style={{ opacity: canRedo ? 1 : 0.3, fontSize: 15 }}>↪</button>
+
+            <div className="tool-sep" />
+
+            {/* Colour section */}
+            <div className="color-section">
+              <div className="color-grid">
+                {PRESET_COLORS.map(c => (
+                    <button key={c} title={c}
+                            className={`color-swatch ${fillColor === c ? "active" : ""}`}
+                            style={{ background: c, outline: c === "#ffffff" ? "1px solid #475569" : "none" }}
+                            onClick={() => setFillColor(c)}
+                    />
+                ))}
+              </div>
+              <label className="color-custom-row" title="Custom colour">
+                <div className="color-preview" style={{ background: fillColor }} />
+                <input type="color" className="color-custom-input"
+                       value={fillColor} onChange={e => setFillColor(e.target.value)} />
+                <span className="color-hex">{fillColor.toUpperCase()}</span>
+              </label>
+            </div>
+          </div>
+
+          {/* Canvas */}
+          <div className="canvas-wrap">
+            <Canvas
+                shapes={activeShapes}
+                tool={tool}
+                myColor={fillColor}
+                locked={lockedByOther}
+                onAcquireLock={tryAcquireLock}
+                onShapeAdd={handleShapeAdd}
+                onShapeUpdate={handleShapeUpdate}
+                onShapeMoveStart={handleShapeMoveStart}
+                onShapeDelete={handleShapeDelete}
+            />
+          </div>
+        </div>
+
+        {/* ── Status bar ── */}
+        <div className="status-bar">
+        <span>
+          {lockedByOther
+              ? `${activeLock.userName} is editing`
+              : iHaveLock ? "You are editing" : "Select a tool and draw — lock acquired automatically"}
+        </span>
+          <span className="status-right">
+          Ctrl+Z · Ctrl+Shift+Z &nbsp;|&nbsp;
+            {activeUsers.length} user{activeUsers.length !== 1 ? "s" : ""} online
+        </span>
+        </div>
+
+        {/* ── Toasts ── */}
+        <div className="toast-stack">
+          {toasts.map(t => <div key={t.id} className="toast">{t.msg}</div>)}
+        </div>
+      </div>
   );
+}
+
+// ── Pure state helpers ────────────────────────────────────────────────────
+function addShape(p, fileId, shape) {
+  if (!p.files[fileId]) return p;
+  return { ...p, files: { ...p.files, [fileId]: { ...p.files[fileId], shapes: [...p.files[fileId].shapes, shape] } } };
+}
+function updateShape(p, fileId, shapeId, changes) {
+  if (!p.files[fileId]) return p;
+  const shapes = p.files[fileId].shapes.map(s => s.id === shapeId ? { ...s, ...changes } : s);
+  return { ...p, files: { ...p.files, [fileId]: { ...p.files[fileId], shapes } } };
+}
+function deleteShape(p, fileId, shapeId) {
+  if (!p.files[fileId]) return p;
+  const shapes = p.files[fileId].shapes.filter(s => s.id !== shapeId);
+  return { ...p, files: { ...p.files, [fileId]: { ...p.files[fileId], shapes } } };
+}
+function setShapes(p, fileId, shapes) {
+  if (!p.files[fileId]) return p;
+  return { ...p, files: { ...p.files, [fileId]: { ...p.files[fileId], shapes } } };
 }
