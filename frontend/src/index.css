@@ -169,7 +169,6 @@ body {
   display: flex; align-items: flex-start; justify-content: flex-start; padding: 24px;
 }
 .canvas-svg {
-  width: 900px; height: 600px;
   background: #ffffff; border-radius: 10px; flex-shrink: 0;
   box-shadow: 0 0 0 1px #334155, 0 20px 60px rgba(0,0,0,0.4);
 }
@@ -240,37 +239,28 @@ body {
 .color-swatch:hover { transform: scale(1.15); }
 .color-swatch.active { box-shadow: 0 0 0 2px #fff, 0 0 0 3px #6366f1; }
 
+/* Custom colour: a swatch that opens the native picker */
 .color-custom-row {
-  display: flex;
-  align-items: center;
-  gap: 5px;
+  position: relative;
+  width: 18px; height: 18px;
+  border-radius: 4px;
+  overflow: hidden;
   cursor: pointer;
-  width: 100%;
-  padding: 4px 5px;
-  border-radius: 6px;
-  border: 1px solid #334155;
-  background: #0f172a;
-}
-.color-custom-row:hover { border-color: #475569; }
-.color-preview {
-  width: 14px; height: 14px;
-  border-radius: 3px;
+  border: 1px dashed #475569;
   flex-shrink: 0;
-  border: 1px solid #475569;
+}
+.color-custom-row:hover { border-color: #94a3b8; }
+.color-preview {
+  width: 100%; height: 100%;
+  display: block;
 }
 .color-custom-input {
-  width: 0; height: 0;
-  opacity: 0;
   position: absolute;
-  pointer-events: none;
-}
-.color-custom-row input[type="color"] {
-  width: 0; height: 0; opacity: 0; position: absolute; pointer-events: none;
-}
-.color-hex {
-  font-size: 9px;
-  color: #64748b;
-  letter-spacing: 0.5px;
-  font-family: monospace;
-  flex: 1;
+  inset: 0;
+  opacity: 0;
+  cursor: pointer;
+  width: 100%;
+  height: 100%;
+  border: none;
+  padding: 0;
 }

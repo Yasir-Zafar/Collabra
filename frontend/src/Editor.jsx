@@ -5,15 +5,15 @@ import Canvas from "./Canvas";
 const PRESET_COLORS = ["#6366f1","#ef4444","#f59e0b","#10b981","#3b82f6","#ec4899","#1e293b","#ffffff"];
 
 export default function Editor({ user, project: initialProject, onBack }) {
-  const [project, setProject]         = useState(null);
+  const [project, setProject]           = useState(null);
   const [activeFileId, setActiveFileId] = useState(null);
-  const [locks, setLocks]             = useState({});
-  const [activeUsers, setActiveUsers] = useState([]);
-  const [tool, setTool]               = useState("select");
-  const [fillColor, setFillColor]     = useState("#6366f1");
-  const [toasts, setToasts]           = useState([]);
-  const toastId   = useRef(0);
-  const historyRef = useRef({}); // { [fileId]: { past: snapshots[], future: snapshots[] } }
+  const [locks, setLocks]               = useState({});
+  const [activeUsers, setActiveUsers]   = useState([]);
+  const [tool, setTool]                 = useState("select");
+  const [fillColor, setFillColor]       = useState("#6366f1");
+  const [toasts, setToasts]             = useState([]);
+  const toastId    = useRef(0);
+  const historyRef = useRef({}); // { [fileId]: { past[], future[] } }
 
   function getHistory(fileId) {
     if (!historyRef.current[fileId]) historyRef.current[fileId] = { past: [], future: [] };
@@ -26,7 +26,7 @@ export default function Editor({ user, project: initialProject, onBack }) {
     setTimeout(() => setToasts(t => t.filter(x => x.id !== id)), 3500);
   }, []);
 
-  // ── Socket setup ──────────────────────────────────────────────────────────
+  // ── Socket ────────────────────────────────────────────────────────────────
   useEffect(() => {
     socket.emit("join_project", {
       userId: user.userId,
@@ -58,11 +58,11 @@ export default function Editor({ user, project: initialProject, onBack }) {
     });
 
     socket.on("lock_denied",   ({ lockedBy }) => toast(`${lockedBy} is editing — please wait`));
-    socket.on("shape_added",   ({ fileId, shape })            => setProject(p => addShape(p, fileId, shape)));
-    socket.on("shape_updated", ({ fileId, shapeId, changes }) => setProject(p => updateShape(p, fileId, shapeId, changes)));
-    socket.on("shape_deleted", ({ fileId, shapeId })          => setProject(p => deleteShape(p, fileId, shapeId)));
-    socket.on("snapshot",      ({ fileId, shapes })           => setProject(p => setShapes(p, fileId, shapes)));
-    socket.on("file_added",    ({ file })                     => setProject(p => ({ ...p, files: { ...p.files, [file.id]: file } })));
+    socket.on("shape_added",   ({ fileId, shape })             => setProject(p => addShape(p, fileId, shape)));
+    socket.on("shape_updated", ({ fileId, shapeId, changes })  => setProject(p => updateShape(p, fileId, shapeId, changes)));
+    socket.on("shape_deleted", ({ fileId, shapeId })           => setProject(p => deleteShape(p, fileId, shapeId)));
+    socket.on("snapshot",      ({ fileId, shapes })            => setProject(p => setShapes(p, fileId, shapes)));
+    socket.on("file_added",    ({ file })                      => setProject(p => ({ ...p, files: { ...p.files, [file.id]: file } })));
 
     return () => {
       ["init_state","users_update","user_joined","user_left","lock_acquired","lock_released",
@@ -81,9 +81,9 @@ export default function Editor({ user, project: initialProject, onBack }) {
     }
     window.addEventListener("keydown", onKey);
     return () => window.removeEventListener("keydown", onKey);
-  }); // no dep array — always captures latest iHaveLock/project
+  });
 
-  // ── Lock helpers ──────────────────────────────────────────────────────────
+  // ── Lock ──────────────────────────────────────────────────────────────────
   const activeLock    = locks[activeFileId];
   const iHaveLock     = activeLock?.userId === user.userId;
   const lockedByOther = !!(activeLock && activeLock.userId !== user.userId);
@@ -129,7 +129,7 @@ export default function Editor({ user, project: initialProject, onBack }) {
     socket.emit("snapshot", { fileId: activeFileId, shapes: next });
   }
 
-  // ── Shape handlers ────────────────────────────────────────────────────────
+  // ── Shapes ────────────────────────────────────────────────────────────────
   function handleShapeAdd(shape) {
     if (!tryAcquireLock()) return;
     snapshotBefore();
@@ -156,10 +156,19 @@ export default function Editor({ user, project: initialProject, onBack }) {
     socket.emit("add_file", { projectId: initialProject.id, fileName: `Page ${Object.keys(project.files).length + 1}` });
   }
 
+  // Export: serialize the SVG with its actual viewBox so nothing is cut off
   function exportCanvas() {
     const svg = document.querySelector(".canvas-svg");
     if (!svg) return;
-    const blob = new Blob([new XMLSerializer().serializeToString(svg)], { type: "image/svg+xml" });
+    // Clone so we can embed fonts/styles without modifying the live DOM
+    const clone = svg.cloneNode(true);
+    clone.setAttribute("xmlns", "http://www.w3.org/2000/svg");
+    const w = svg.getAttribute("width");
+    const h = svg.getAttribute("height");
+    clone.setAttribute("width", w);
+    clone.setAttribute("height", h);
+    clone.setAttribute("viewBox", `0 0 ${w} ${h}`);
+    const blob = new Blob([new XMLSerializer().serializeToString(clone)], { type: "image/svg+xml" });
     const url  = URL.createObjectURL(blob);
     const a    = document.createElement("a");
     a.href = url; a.download = `${project.name}.svg`; a.click();
@@ -170,7 +179,10 @@ export default function Editor({ user, project: initialProject, onBack }) {
     const file = e.target.files[0];
     if (!file || !tryAcquireLock()) return;
     const reader = new FileReader();
-    reader.onload = ev => handleShapeAdd({ id: crypto.randomUUID(), type: "image", x: 80, y: 80, w: 200, h: 150, href: ev.target.result });
+    reader.onload = ev => handleShapeAdd({
+      id: crypto.randomUUID(), type: "image",
+      x: 80, y: 80, w: 200, h: 150, href: ev.target.result,
+    });
     reader.readAsDataURL(file);
     e.target.value = "";
   }
@@ -193,7 +205,7 @@ export default function Editor({ user, project: initialProject, onBack }) {
   return (
       <div className="editor-bg">
 
-        {/* ── Topbar ── */}
+        {/* Topbar */}
         <div className="topbar">
           <div className="top-left">
             <button className="btn-ghost" onClick={onBack}>← Back</button>
@@ -232,7 +244,7 @@ export default function Editor({ user, project: initialProject, onBack }) {
           </div>
         </div>
 
-        {/* ── Lock banners ── */}
+        {/* Lock banners */}
         {lockedByOther && (
             <div className="lock-banner" style={{ borderColor: activeLock.color, background: activeLock.color + "18" }}>
               <strong>{activeLock.userName}</strong>&nbsp;is editing — view only
@@ -245,7 +257,7 @@ export default function Editor({ user, project: initialProject, onBack }) {
             </div>
         )}
 
-        {/* ── Editor body ── */}
+        {/* Editor body */}
         <div className="editor-body">
 
           {/* Toolbar */}
@@ -269,13 +281,13 @@ export default function Editor({ user, project: initialProject, onBack }) {
             <div className="tool-sep" />
 
             <button className="tool-btn" title="Undo (Ctrl+Z)"
-                    onClick={doUndo} style={{ opacity: canUndo ? 1 : 0.3, fontSize: 15 }}>↩</button>
+                    onClick={doUndo} style={{ opacity: canUndo ? 1 : 0.3, fontSize:15 }}>↩</button>
             <button className="tool-btn" title="Redo (Ctrl+Shift+Z)"
-                    onClick={doRedo} style={{ opacity: canRedo ? 1 : 0.3, fontSize: 15 }}>↪</button>
+                    onClick={doRedo} style={{ opacity: canRedo ? 1 : 0.3, fontSize:15 }}>↪</button>
 
             <div className="tool-sep" />
 
-            {/* Colour section */}
+            {/* Colour picker */}
             <div className="color-section">
               <div className="color-grid">
                 {PRESET_COLORS.map(c => (
@@ -286,32 +298,30 @@ export default function Editor({ user, project: initialProject, onBack }) {
                     />
                 ))}
               </div>
+              {/* Custom colour: preview swatch doubles as the color input trigger */}
               <label className="color-custom-row" title="Custom colour">
                 <div className="color-preview" style={{ background: fillColor }} />
                 <input type="color" className="color-custom-input"
                        value={fillColor} onChange={e => setFillColor(e.target.value)} />
-                <span className="color-hex">{fillColor.toUpperCase()}</span>
               </label>
             </div>
           </div>
 
-          {/* Canvas */}
-          <div className="canvas-wrap">
-            <Canvas
-                shapes={activeShapes}
-                tool={tool}
-                myColor={fillColor}
-                locked={lockedByOther}
-                onAcquireLock={tryAcquireLock}
-                onShapeAdd={handleShapeAdd}
-                onShapeUpdate={handleShapeUpdate}
-                onShapeMoveStart={handleShapeMoveStart}
-                onShapeDelete={handleShapeDelete}
-            />
-          </div>
+          {/* Canvas — now owns its wrapper div internally */}
+          <Canvas
+              shapes={activeShapes}
+              tool={tool}
+              myColor={fillColor}
+              locked={lockedByOther}
+              onAcquireLock={tryAcquireLock}
+              onShapeAdd={handleShapeAdd}
+              onShapeUpdate={handleShapeUpdate}
+              onShapeMoveStart={handleShapeMoveStart}
+              onShapeDelete={handleShapeDelete}
+          />
         </div>
 
-        {/* ── Status bar ── */}
+        {/* Status bar */}
         <div className="status-bar">
         <span>
           {lockedByOther
@@ -324,7 +334,7 @@ export default function Editor({ user, project: initialProject, onBack }) {
         </span>
         </div>
 
-        {/* ── Toasts ── */}
+        {/* Toasts */}
         <div className="toast-stack">
           {toasts.map(t => <div key={t.id} className="toast">{t.msg}</div>)}
         </div>
@@ -332,7 +342,7 @@ export default function Editor({ user, project: initialProject, onBack }) {
   );
 }
 
-// ── Pure state helpers ────────────────────────────────────────────────────
+// ── Pure helpers ──────────────────────────────────────────────────────────
 function addShape(p, fileId, shape) {
   if (!p.files[fileId]) return p;
   return { ...p, files: { ...p.files, [fileId]: { ...p.files[fileId], shapes: [...p.files[fileId].shapes, shape] } } };
