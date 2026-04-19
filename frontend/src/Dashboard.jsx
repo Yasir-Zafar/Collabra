@@ -6,7 +6,10 @@ export default function Dashboard({ user, onOpen }) {
   const [loading, setLoading] = useState(true);
 
   useEffect(() => {
-    fetch("http://localhost:3001/projects")
+    const token = localStorage.getItem("authToken");
+    fetch("http://localhost:3001/projects", {
+      headers: { "Authorization": `Bearer ${token}` },
+    })
       .then(r => r.json())
       .then(data => { setProjects(data); setLoading(false); });
   }, []);
@@ -14,10 +17,14 @@ export default function Dashboard({ user, onOpen }) {
   async function createProject() {
     const trimmed = newName.trim();
     if (!trimmed) return;
+    const token = localStorage.getItem("authToken");
     const res = await fetch("http://localhost:3001/projects", {
       method: "POST",
-      headers: { "Content-Type": "application/json" },
-      body: JSON.stringify({ name: trimmed, userId: user.userId, userName: user.userName }),
+      headers: {
+        "Content-Type": "application/json",
+        "Authorization": `Bearer ${token}`,
+      },
+      body: JSON.stringify({ name: trimmed }),
     });
     const project = await res.json();
     setProjects(p => [...p, { id: project.id, name: project.name, ownerName: project.ownerName, fileCount: 1 }]);

@@ -1,4 +1,8 @@
 require("dotenv").config();
+const dns = require("dns");
+// Avoid flaky IPv6-only DNS results on some networks/routers.
+dns.setDefaultResultOrder("ipv4first");
+
 const express = require("express");
 const http = require("http");
 const { Server } = require("socket.io");
@@ -21,31 +25,16 @@ function hashPassword(password) {
   return crypto.createHash("sha256").update(password).digest("hex");
 }
 
-// ── Initialize database ────────────────────────────────────────────────
-async function initDb() {
-  try {
-    await sql`
-      CREATE TABLE IF NOT EXISTS users (
-        id uuid PRIMARY KEY DEFAULT gen_random_uuid(),
-        email varchar(255) UNIQUE NOT NULL,
-        display_name varchar(255) NOT NULL,
-        password varchar(255) NOT NULL,
-        created_at timestamp DEFAULT CURRENT_TIMESTAMP
-      )
-    `;
-    console.log("✓ Database initialized");
-  } catch (err) {
-    console.error("✗ Database init error:", err);
-  }
+function idToString(v) {
+  return typeof v === "bigint" ? v.toString() : v;
 }
 
-initDb();
-
 // ── In-memory state ──────────────────────────────────────────────────────
-const projects = {};
 const sessions = {};  // socketId -> { userId, userName, color, projectId }
 const locks = {};     // fileId  -> { userId, userName, color, socketId }
 const tokens = {};    // token -> { userId, email, displayName, createdAt }
+const saveTimers = {}; // fileId -> Timeout (debounced DB snapshot writes)
+const fileStates = {}; // fileId -> shapes[] (in-memory working set for debounce)
 
 const COLORS = ["#6366f1","#f59e0b","#10b981","#ef4444","#3b82f6","#ec4899","#14b8a6","#f97316"];
 const assignedColors = {};
@@ -55,23 +44,102 @@ function colorFor(userId) {
   return assignedColors[userId];
 }
 
-// Seed a demo project
-const DEMO_ID = "demo";
-projects[DEMO_ID] = {
-  id: DEMO_ID,
-  name: "Demo Project",
-  ownerId: "system",
-  ownerName: "System",
-  files: {
-    "f1": { id: "f1", name: "Page 1", shapes: [] },
-    "f2": { id: "f2", name: "Page 2", shapes: [] },
-  },
-};
-
 function usersInProject(projectId) {
   return Object.values(sessions)
       .filter(s => s.projectId === projectId)
       .map(s => ({ userId: s.userId, userName: s.userName, color: s.color }));
+}
+
+async function loadProjectForUser({ projectId, userId }) {
+  const access = await sql`
+    SELECT
+      p.id,
+      p.name,
+      p.owner_id,
+      u.display_name AS owner_name,
+      COALESCE(pm.role, 'viewer'::project_role) AS my_role
+    FROM projects p
+    JOIN users u ON u.id = p.owner_id
+    LEFT JOIN project_members pm
+      ON pm.project_id = p.id AND pm.user_id = ${userId}
+    WHERE p.id = ${projectId}
+      AND (p.owner_id = ${userId} OR pm.user_id IS NOT NULL)
+    LIMIT 1
+  `;
+  if (!access.length) return null;
+
+  const files = await sql`
+    SELECT id, name, shapes
+    FROM project_files
+    WHERE project_id = ${projectId}
+    ORDER BY created_at ASC
+  `;
+
+  const filesMap = {};
+  for (const f of files) {
+    let shapes = [];
+    if (Array.isArray(f.shapes)) {
+      shapes = f.shapes;
+    } else if (typeof f.shapes === "string") {
+      try {
+        const parsed = JSON.parse(f.shapes);
+        shapes = Array.isArray(parsed) ? parsed : [];
+      } catch {
+        shapes = [];
+      }
+    } else if (f.shapes && typeof f.shapes === "object") {
+      // Some clients return jsonb as plain JS objects/arrays
+      shapes = Array.isArray(f.shapes) ? f.shapes : [];
+    }
+
+    console.log(`[db] load file ${f.id} "${f.name}": shapesType=${typeof f.shapes} shapesIsArray=${Array.isArray(f.shapes)} shapesLen=${Array.isArray(shapes) ? shapes.length : "n/a"}`);
+    filesMap[f.id] = { id: f.id, name: f.name, shapes };
+  }
+
+  return {
+    project: {
+      id: access[0].id,
+      name: access[0].name,
+      ownerId: idToString(access[0].owner_id),
+      ownerName: access[0].owner_name,
+      files: filesMap,
+    },
+    role: access[0].my_role,
+  };
+}
+
+async function flushFileSnapshot(fileId) {
+  const shapes = Array.isArray(fileStates[fileId]) ? fileStates[fileId] : null;
+  if (!shapes) return;
+  clearTimeout(saveTimers[fileId]);
+  delete saveTimers[fileId];
+  try {
+    console.log(`[db] flush file ${fileId}: shapesLen=${shapes.length}`);
+    await sql`
+      UPDATE project_files
+      SET shapes = ${JSON.stringify(shapes)}::jsonb
+      WHERE id = ${fileId}
+    `;
+  } catch (err) {
+    console.error("Snapshot flush error:", err);
+  }
+}
+
+function scheduleSaveFileSnapshot({ fileId, shapes }) {
+  fileStates[fileId] = shapes;
+  clearTimeout(saveTimers[fileId]);
+  saveTimers[fileId] = setTimeout(async () => {
+    try {
+      console.log(`[db] save file ${fileId}: shapesLen=${Array.isArray(shapes) ? shapes.length : "n/a"}`);
+      await sql`
+        UPDATE project_files
+        SET shapes = ${JSON.stringify(shapes)}::jsonb
+        WHERE id = ${fileId}
+      `;
+    } catch (err) {
+      console.error("Snapshot save error:", err);
+    }
+  }, 400);
 }
 
 // ── Auth middleware ──────────────────────────────────────────────────
@@ -107,9 +175,9 @@ app.post("/auth/signup", async (req, res) => {
     `;
 
     const token = uuidv4();
-    tokens[token] = { userId: user[0].id, email: user[0].email, displayName: user[0].display_name };
+    tokens[token] = { userId: idToString(user[0].id), email: user[0].email, displayName: user[0].display_name };
 
-    res.json({ token, user: { userId: user[0].id, userName: user[0].display_name, email: user[0].email } });
+    res.json({ token, user: { userId: idToString(user[0].id), userName: user[0].display_name, email: user[0].email } });
   } catch (err) {
     console.error("Signup error:", err);
     res.status(500).json({ error: "Signup failed" });
@@ -136,9 +204,9 @@ app.post("/auth/login", async (req, res) => {
     }
 
     const token = uuidv4();
-    tokens[token] = { userId: user.id, email: user.email, displayName: user.display_name };
+    tokens[token] = { userId: idToString(user.id), email: user.email, displayName: user.display_name };
 
-    res.json({ token, user: { userId: user.id, userName: user.display_name, email: user.email } });
+    res.json({ token, user: { userId: idToString(user.id), userName: user.display_name, email: user.email } });
   } catch (err) {
     console.error("Login error:", err);
     res.status(500).json({ error: "Login failed" });
@@ -147,57 +215,222 @@ app.post("/auth/login", async (req, res) => {
 
 // Verify token route
 app.post("/auth/verify", verifyToken, (req, res) => {
-  res.json({ user: { userId: req.user.userId, userName: req.user.displayName, email: req.user.email } });
+  res.json({ user: { userId: idToString(req.user.userId), userName: req.user.displayName, email: req.user.email } });
 });
 
 // Project endpoints
-app.get("/projects", (_req, res) => {
-  res.json(Object.values(projects).map(p => ({
-    id: p.id,
-    name: p.name,
-    ownerName: p.ownerName,
-    fileCount: Object.keys(p.files).length,
-  })));
+app.get("/projects", verifyToken, async (req, res) => {
+  const userId = req.user.userId;
+  try {
+    const rows = await sql`
+      SELECT
+        p.id,
+        p.name,
+        u.display_name AS owner_name,
+        COALESCE(pm.role, 'viewer'::project_role) AS my_role,
+        (SELECT COUNT(*)::int FROM project_files f WHERE f.project_id = p.id) AS file_count
+      FROM projects p
+      JOIN users u ON u.id = p.owner_id
+      LEFT JOIN project_members pm
+        ON pm.project_id = p.id AND pm.user_id = ${userId}
+      WHERE p.owner_id = ${userId} OR pm.user_id IS NOT NULL
+      ORDER BY p.created_at DESC
+    `;
+    res.json(rows.map(r => ({
+      id: r.id,
+      name: r.name,
+      ownerName: r.owner_name,
+      fileCount: r.file_count,
+      myRole: r.my_role,
+    })));
+  } catch (err) {
+    console.error("List projects error:", err);
+    res.status(500).json({ error: "Failed to list projects" });
+  }
 });
 
-app.post("/projects", (req, res) => {
-  const { name, userId, userName } = req.body;
-  const id = uuidv4();
-  const fileId = uuidv4();
-  projects[id] = {
-    id, name,
-    ownerId: userId,
-    ownerName: userName,
-    files: { [fileId]: { id: fileId, name: "Page 1", shapes: [] } },
-  };
-  res.json(projects[id]);
+app.post("/projects", verifyToken, async (req, res) => {
+  const { name } = req.body;
+  const ownerId = req.user.userId;
+  if (!name || !String(name).trim()) return res.status(400).json({ error: "Missing name" });
+
+  try {
+    const project = await sql`
+      INSERT INTO projects (name, owner_id)
+      VALUES (${String(name).trim()}, ${ownerId})
+      RETURNING id, name, owner_id
+    `;
+    await sql`
+      INSERT INTO project_members (project_id, user_id, role)
+      VALUES (${project[0].id}, ${ownerId}, 'editor')
+      ON CONFLICT (project_id, user_id) DO NOTHING
+    `;
+    const file = await sql`
+      INSERT INTO project_files (project_id, name, shapes)
+      VALUES (${project[0].id}, 'Page 1', '[]'::jsonb)
+      RETURNING id, name
+    `;
+    const owner = await sql`SELECT display_name FROM users WHERE id = ${ownerId} LIMIT 1`;
+    res.json({
+      id: project[0].id,
+      name: project[0].name,
+      ownerId: idToString(project[0].owner_id),
+      ownerName: owner[0]?.display_name ?? req.user.displayName,
+      files: { [file[0].id]: { id: file[0].id, name: file[0].name, shapes: [] } },
+      myRole: "editor",
+    });
+  } catch (err) {
+    console.error("Create project error:", err);
+    res.status(500).json({ error: "Failed to create project" });
+  }
+});
+
+app.get("/projects/:projectId", verifyToken, async (req, res) => {
+  const projectId = req.params.projectId;
+  const userId = req.user.userId;
+  try {
+    const loaded = await loadProjectForUser({ projectId, userId });
+    if (!loaded) return res.status(404).json({ error: "Project not found" });
+    res.json({ ...loaded.project, myRole: loaded.role });
+  } catch (err) {
+    console.error("Get project error:", err);
+    res.status(500).json({ error: "Failed to load project" });
+  }
+});
+
+// Owner: invite existing user by email (no invite links)
+app.post("/projects/:projectId/members", verifyToken, async (req, res) => {
+  const projectId = req.params.projectId;
+  const ownerId = req.user.userId;
+  const { email, role } = req.body;
+  const safeRole = role === "viewer" ? "viewer" : "editor";
+  if (!email) return res.status(400).json({ error: "Missing email" });
+
+  try {
+    const p = await sql`SELECT owner_id FROM projects WHERE id = ${projectId} LIMIT 1`;
+    if (!p.length) return res.status(404).json({ error: "Project not found" });
+    if (String(p[0].owner_id) !== String(ownerId)) return res.status(403).json({ error: "Owner only" });
+
+    const u = await sql`SELECT id, display_name, email FROM users WHERE email = ${email} LIMIT 1`;
+    if (!u.length) return res.status(404).json({ error: "User not found" });
+    if (String(u[0].id) === String(ownerId)) return res.status(400).json({ error: "Owner is already a member" });
+
+    await sql`
+      INSERT INTO project_members (project_id, user_id, role)
+      VALUES (${projectId}, ${u[0].id}, ${safeRole}::project_role)
+      ON CONFLICT (project_id, user_id) DO UPDATE SET role = EXCLUDED.role
+    `;
+    res.json({ ok: true, userId: u[0].id, userName: u[0].display_name, email: u[0].email, role: safeRole });
+  } catch (err) {
+    console.error("Invite member error:", err);
+    res.status(500).json({ error: "Failed to add member" });
+  }
+});
+
+app.patch("/projects/:projectId/members/:userId", verifyToken, async (req, res) => {
+  const projectId = req.params.projectId;
+  const ownerId = req.user.userId;
+  const targetUserId = req.params.userId;
+  const { role } = req.body;
+  const safeRole = role === "viewer" ? "viewer" : "editor";
+
+  try {
+    const p = await sql`SELECT owner_id FROM projects WHERE id = ${projectId} LIMIT 1`;
+    if (!p.length) return res.status(404).json({ error: "Project not found" });
+    if (String(p[0].owner_id) !== String(ownerId)) return res.status(403).json({ error: "Owner only" });
+    if (String(targetUserId) === String(ownerId)) return res.status(400).json({ error: "Cannot change owner role" });
+
+    const updated = await sql`
+      UPDATE project_members
+      SET role = ${safeRole}::project_role
+      WHERE project_id = ${projectId} AND user_id = ${targetUserId}
+      RETURNING user_id, role
+    `;
+    if (!updated.length) return res.status(404).json({ error: "Member not found" });
+    res.json({ ok: true, userId: updated[0].user_id, role: updated[0].role });
+  } catch (err) {
+    console.error("Update member role error:", err);
+    res.status(500).json({ error: "Failed to update role" });
+  }
+});
+
+app.delete("/projects/:projectId/members/:userId", verifyToken, async (req, res) => {
+  const projectId = req.params.projectId;
+  const ownerId = req.user.userId;
+  const targetUserId = req.params.userId;
+
+  try {
+    const p = await sql`SELECT owner_id FROM projects WHERE id = ${projectId} LIMIT 1`;
+    if (!p.length) return res.status(404).json({ error: "Project not found" });
+    if (String(p[0].owner_id) !== String(ownerId)) return res.status(403).json({ error: "Owner only" });
+    if (String(targetUserId) === String(ownerId)) return res.status(400).json({ error: "Cannot remove owner" });
+
+    await sql`
+      DELETE FROM project_members
+      WHERE project_id = ${projectId} AND user_id = ${targetUserId}
+    `;
+    res.json({ ok: true });
+  } catch (err) {
+    console.error("Kick member error:", err);
+    res.status(500).json({ error: "Failed to remove member" });
+  }
+});
+
+app.delete("/projects/:projectId", verifyToken, async (req, res) => {
+  const projectId = req.params.projectId;
+  const ownerId = req.user.userId;
+  try {
+    const p = await sql`SELECT owner_id FROM projects WHERE id = ${projectId} LIMIT 1`;
+    if (!p.length) return res.status(404).json({ error: "Project not found" });
+    if (String(p[0].owner_id) !== String(ownerId)) return res.status(403).json({ error: "Owner only" });
+
+    await sql`DELETE FROM projects WHERE id = ${projectId}`;
+    res.json({ ok: true });
+  } catch (err) {
+    console.error("Delete project error:", err);
+    res.status(500).json({ error: "Failed to delete project" });
+  }
 });
 
 // ── Socket.io ────────────────────────────────────────────────────────────
+io.use((socket, next) => {
+  const token = socket.handshake.auth?.token;
+  if (!token || !tokens[token]) return next(new Error("Unauthorized"));
+  socket.user = tokens[token];
+  next();
+});
+
 io.on("connection", (socket) => {
   console.log("+ connected:", socket.id);
 
-  socket.on("join_project", ({ userId, userName, projectId }) => {
-    const color = colorFor(userId);
-    sessions[socket.id] = { userId, userName, color, projectId };
-    socket.join(projectId);
+  socket.on("join_project", async ({ projectId }) => {
+    const userId = socket.user.userId;
+    const userName = socket.user.displayName;
+    const loaded = await loadProjectForUser({ projectId, userId });
+    if (!loaded) { socket.emit("error_msg", "Project not found"); return; }
 
-    const project = projects[projectId];
-    if (!project) { socket.emit("error_msg", "Project not found"); return; }
+    const color = colorFor(userId);
+    sessions[socket.id] = { userId, userName, color, projectId, role: loaded.role };
+    socket.join(projectId);
 
     const projectLocks = {};
     for (const [fid, lock] of Object.entries(locks)) {
-      if (project.files[fid]) projectLocks[fid] = lock;
+      if (loaded.project.files[fid]) projectLocks[fid] = lock;
     }
-    socket.emit("init_state", { project, locks: projectLocks, color });
+    // Seed in-memory file state for debounced saves.
+    for (const f of Object.values(loaded.project.files)) {
+      fileStates[f.id] = f.shapes ?? [];
+    }
+    socket.emit("init_state", { project: loaded.project, locks: projectLocks, color, myRole: loaded.role });
     socket.to(projectId).emit("user_joined", { userId, userName, color });
     io.to(projectId).emit("users_update", usersInProject(projectId));
-    console.log(`  ${userName} joined ${projectId}`);
+    console.log(`  ${userName} joined ${projectId} (${loaded.role})`);
   });
 
   socket.on("acquire_lock", ({ fileId }) => {
     const session = sessions[socket.id];
     if (!session) return;
+    if (session.role !== "editor") return;
     const existing = locks[fileId];
     if (existing && existing.socketId !== socket.id) {
       socket.emit("lock_denied", { fileId, lockedBy: existing.userName });
@@ -210,6 +443,7 @@ io.on("connection", (socket) => {
   socket.on("release_lock", ({ fileId }) => {
     const session = sessions[socket.id];
     if (!session || locks[fileId]?.socketId !== socket.id) return;
+    flushFileSnapshot(fileId);
     delete locks[fileId];
     io.to(session.projectId).emit("lock_released", { fileId });
   });
@@ -217,47 +451,62 @@ io.on("connection", (socket) => {
   socket.on("shape_add", ({ fileId, shape }) => {
     const session = sessions[socket.id];
     if (!session || locks[fileId]?.socketId !== socket.id) return;
-    const file = projects[session.projectId]?.files[fileId];
-    if (!file) return;
-    file.shapes.push(shape);
+    if (session.role !== "editor") return;
+    const current = Array.isArray(fileStates[fileId]) ? fileStates[fileId] : [];
+    const next = [...current, shape];
+    scheduleSaveFileSnapshot({ fileId, shapes: next });
     socket.to(session.projectId).emit("shape_added", { fileId, shape });
   });
 
   socket.on("shape_update", ({ fileId, shapeId, changes }) => {
     const session = sessions[socket.id];
     if (!session || locks[fileId]?.socketId !== socket.id) return;
-    const file = projects[session.projectId]?.files[fileId];
-    if (!file) return;
-    const idx = file.shapes.findIndex(s => s.id === shapeId);
-    if (idx !== -1) file.shapes[idx] = { ...file.shapes[idx], ...changes };
+    if (session.role !== "editor") return;
+    const current = Array.isArray(fileStates[fileId]) ? fileStates[fileId] : [];
+    const next = current.map(s => (s?.id === shapeId ? { ...s, ...changes } : s));
+    scheduleSaveFileSnapshot({ fileId, shapes: next });
     socket.to(session.projectId).emit("shape_updated", { fileId, shapeId, changes });
   });
 
   socket.on("shape_delete", ({ fileId, shapeId }) => {
     const session = sessions[socket.id];
     if (!session || locks[fileId]?.socketId !== socket.id) return;
-    const file = projects[session.projectId]?.files[fileId];
-    if (!file) return;
-    file.shapes = file.shapes.filter(s => s.id !== shapeId);
+    if (session.role !== "editor") return;
+    const current = Array.isArray(fileStates[fileId]) ? fileStates[fileId] : [];
+    const next = current.filter(s => s?.id !== shapeId);
+    scheduleSaveFileSnapshot({ fileId, shapes: next });
     socket.to(session.projectId).emit("shape_deleted", { fileId, shapeId });
   });
 
   socket.on("snapshot", ({ fileId, shapes }) => {
     const session = sessions[socket.id];
     if (!session || locks[fileId]?.socketId !== socket.id) return;
-    const file = projects[session.projectId]?.files[fileId];
-    if (!file) return;
-    file.shapes = shapes;
+    if (session.role !== "editor") return;
+    scheduleSaveFileSnapshot({ fileId, shapes });
     socket.to(session.projectId).emit("snapshot", { fileId, shapes });
   });
 
   socket.on("add_file", ({ projectId, fileName }) => {
-    const project = projects[projectId];
-    if (!project) return;
-    const fileId = uuidv4();
-    const file = { id: fileId, name: fileName, shapes: [] };
-    project.files[fileId] = file;
-    io.to(projectId).emit("file_added", { file });
+    // Deprecated: use add_file_v2 (no in-memory projects anymore).
+  });
+
+  socket.on("add_file_v2", async ({ fileName }) => {
+    const session = sessions[socket.id];
+    if (!session) return;
+    if (session.role !== "editor") return;
+    const name = String(fileName || "").trim();
+    if (!name) return;
+    try {
+      const file = await sql`
+        INSERT INTO project_files (project_id, name, shapes)
+        VALUES (${session.projectId}, ${name}, '[]'::jsonb)
+        RETURNING id, name
+      `;
+      fileStates[file[0].id] = [];
+      io.to(session.projectId).emit("file_added", { file: { id: file[0].id, name: file[0].name, shapes: [] } });
+    } catch (err) {
+      console.error("Add file error:", err);
+    }
   });
 
   socket.on("disconnect", () => {
@@ -265,6 +514,7 @@ io.on("connection", (socket) => {
     if (!session) return;
     for (const [fid, lock] of Object.entries(locks)) {
       if (lock.socketId === socket.id) {
+        flushFileSnapshot(fid);
         delete locks[fid];
         io.to(session.projectId).emit("lock_released", { fileId: fid });
       }

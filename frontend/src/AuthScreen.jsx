@@ -1,4 +1,5 @@
 import { useState } from "react";
+import { connectSocketWithToken } from "./socket";
 
 export default function AuthScreen({ onLogin }) {
   const [mode, setMode] = useState("login"); // "login" or "signup"
@@ -45,6 +46,7 @@ export default function AuthScreen({ onLogin }) {
 
       // Store token and call onLogin
       localStorage.setItem("authToken", data.token);
+      connectSocketWithToken(data.token);
       onLogin(data.user);
     } catch (e) {
       setErr("Network error: " + e.message);

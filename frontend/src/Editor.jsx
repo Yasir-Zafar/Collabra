@@ -1,5 +1,5 @@
 import { useState, useEffect, useCallback, useRef } from "react";
-import socket from "./socket";
+import { socket } from "./socket";
 import Canvas from "./Canvas";
 
 const PRESET_COLORS = ["#6366f1","#ef4444","#f59e0b","#10b981","#3b82f6","#ec4899","#1e293b","#ffffff"];
@@ -9,11 +9,15 @@ export default function Editor({ user, project: initialProject, onBack }) {
   const [activeFileId, setActiveFileId] = useState(null);
   const [locks, setLocks]               = useState({});
   const [activeUsers, setActiveUsers]   = useState([]);
+  const [myRole, setMyRole]             = useState("viewer");
+  const [loadErr, setLoadErr]           = useState("");
   const [tool, setTool]                 = useState("select");
   const [fillColor, setFillColor]       = useState("#6366f1");
   const [toasts, setToasts]             = useState([]);
   const toastId    = useRef(0);
   const historyRef = useRef({}); // { [fileId]: { past[], future[] } }
+  const joinedRef  = useRef(false);
+  const activeFileIdRef = useRef(null);
 
   function getHistory(fileId) {
     if (!historyRef.current[fileId]) historyRef.current[fileId] = { past: [], future: [] };
@@ -28,21 +32,59 @@ export default function Editor({ user, project: initialProject, onBack }) {
 
   // ── Socket ────────────────────────────────────────────────────────────────
   useEffect(() => {
-    socket.emit("join_project", {
-      userId: user.userId,
-      userName: user.userName,
-      projectId: initialProject.id,
-    });
+    joinedRef.current = false;
+    setProject(null);
+    setActiveFileId(null);
+    setLoadErr("");
 
-    socket.on("init_state", ({ project: p, locks: l }) => {
+    let cancelled = false;
+    async function loadViaRest() {
+      try {
+        const token = localStorage.getItem("authToken");
+        const res = await fetch(`http://localhost:3001/projects/${initialProject.id}`, {
+          headers: { "Authorization": `Bearer ${token}` },
+        });
+        const data = await res.json();
+        if (!res.ok) throw new Error(data?.error || "Failed to load project");
+        if (cancelled) return;
+        setProject(data);
+        const firstFileId = Object.keys(data.files || {})[0] || null;
+        setActiveFileId(firstFileId);
+        setMyRole(data.myRole || "viewer");
+      } catch (e) {
+        if (cancelled) return;
+        setLoadErr(e?.message || "Failed to load project");
+      }
+    }
+
+    // Load immediately via REST so we never depend on socket timing.
+    loadViaRest();
+
+    socket.on("init_state", ({ project: p, locks: l, myRole: role }) => {
       setProject(p);
       setLocks(l);
-      setActiveFileId(Object.keys(p.files)[0]);
+      setActiveFileId(Object.keys(p.files)[0] || null);
+      setMyRole(role || "viewer");
     });
 
     socket.on("users_update", (users) => setActiveUsers(users));
     socket.on("user_joined",  ({ userName }) => toast(`${userName} joined`));
     socket.on("user_left",    ({ userId })   => setActiveUsers(u => u.filter(x => x.userId !== userId)));
+    socket.on("error_msg",    (msg) => toast(String(msg || "Error")));
+    socket.on("connect_error", (err) => toast(err?.message ? `Socket: ${err.message}` : "Socket error"));
+
+    function joinOnce() {
+      if (joinedRef.current) return;
+      joinedRef.current = true;
+      socket.emit("join_project", { projectId: initialProject.id });
+    }
+
+    if (socket.connected) {
+      joinOnce();
+    } else {
+      socket.once("connect", joinOnce);
+      socket.connect();
+    }
 
     socket.on("lock_acquired", ({ fileId, userId, userName, color }) => {
       setLocks(l => ({ ...l, [fileId]: { userId, userName, color } }));
@@ -65,9 +107,15 @@ export default function Editor({ user, project: initialProject, onBack }) {
     socket.on("file_added",    ({ file })                      => setProject(p => ({ ...p, files: { ...p.files, [file.id]: file } })));
 
     return () => {
+      cancelled = true;
+      // Flush/cleanup: release any lock we might hold so server persists snapshot.
+      const fid = activeFileIdRef.current;
+      if (fid) socket.emit("release_lock", { fileId: fid });
       ["init_state","users_update","user_joined","user_left","lock_acquired","lock_released",
-        "lock_denied","shape_added","shape_updated","shape_deleted","snapshot","file_added"]
+        "lock_denied","shape_added","shape_updated","shape_deleted","snapshot","file_added","error_msg","connect_error"]
           .forEach(ev => socket.off(ev));
+      socket.off("connect", joinOnce);
+      socket.off("connect_error");
     };
   }, [initialProject.id, user.userId, user.userName, toast]);
 
@@ -87,8 +135,10 @@ export default function Editor({ user, project: initialProject, onBack }) {
   const activeLock    = locks[activeFileId];
   const iHaveLock     = activeLock?.userId === user.userId;
   const lockedByOther = !!(activeLock && activeLock.userId !== user.userId);
+  const viewOnly      = myRole !== "editor";
 
   function tryAcquireLock() {
+    if (viewOnly) { toast("View only"); return false; }
     if (iHaveLock) return true;
     if (lockedByOther) { toast(`${activeLock.userName} is editing — please wait`); return false; }
     socket.emit("acquire_lock", { fileId: activeFileId });
@@ -153,7 +203,8 @@ export default function Editor({ user, project: initialProject, onBack }) {
   }
 
   function addPage() {
-    socket.emit("add_file", { projectId: initialProject.id, fileName: `Page ${Object.keys(project.files).length + 1}` });
+    if (viewOnly) return;
+    socket.emit("add_file_v2", { fileName: `Page ${Object.keys(project.files).length + 1}` });
   }
 
   // Export: serialize the SVG with its actual viewBox so nothing is cut off
@@ -188,6 +239,16 @@ export default function Editor({ user, project: initialProject, onBack }) {
   }
 
   // ── Render ────────────────────────────────────────────────────────────────
+  if (loadErr) {
+    return (
+      <div style={{ height:"100vh", display:"flex", flexDirection:"column", gap:10, alignItems:"center", justifyContent:"center", background:"#0f172a", color:"#94a3b8", fontSize:14, padding:24, textAlign:"center" }}>
+        <div style={{ color:"#e2e8f0", fontSize:16, fontWeight:600 }}>Couldn’t open project</div>
+        <div style={{ maxWidth: 560 }}>{loadErr}</div>
+        <button className="btn-primary" onClick={() => window.location.reload()}>Reload</button>
+      </div>
+    );
+  }
+
   if (!project || !activeFileId) {
     return (
         <div style={{ height:"100vh", display:"flex", alignItems:"center", justifyContent:"center", background:"#0f172a", color:"#64748b", fontSize:14 }}>
@@ -198,6 +259,7 @@ export default function Editor({ user, project: initialProject, onBack }) {
 
   const files        = Object.values(project.files);
   const activeShapes = project.files[activeFileId]?.shapes ?? [];
+  activeFileIdRef.current = activeFileId;
   const h            = getHistory(activeFileId);
   const canUndo      = iHaveLock && h.past.length > 0;
   const canRedo      = iHaveLock && h.future.length > 0;
@@ -224,15 +286,17 @@ export default function Editor({ user, project: initialProject, onBack }) {
                   )}
                 </div>
             ))}
-            <div className="file-tab add-tab" onClick={addPage}>+</div>
+            {!viewOnly && <div className="file-tab add-tab" onClick={addPage}>+</div>}
           </div>
 
           <div className="top-right">
             <button className="topbar-btn" onClick={exportCanvas}>Export SVG</button>
-            <label className="topbar-btn" style={{ cursor:"pointer" }}>
-              Add Image
-              <input type="file" accept="image/*" style={{ display:"none" }} onChange={handleImageUpload} />
-            </label>
+            {!viewOnly && (
+              <label className="topbar-btn" style={{ cursor:"pointer" }}>
+                Add Image
+                <input type="file" accept="image/*" style={{ display:"none" }} onChange={handleImageUpload} />
+              </label>
+            )}
             <div className="top-divider" />
             <div className="active-users">
               {activeUsers.map(u => (
@@ -249,6 +313,11 @@ export default function Editor({ user, project: initialProject, onBack }) {
             <div className="lock-banner" style={{ borderColor: activeLock.color, background: activeLock.color + "18" }}>
               <strong>{activeLock.userName}</strong>&nbsp;is editing — view only
             </div>
+        )}
+        {viewOnly && !lockedByOther && (
+          <div className="lock-banner" style={{ borderColor: "#475569", background: "#47556918" }}>
+            View only
+          </div>
         )}
         {iHaveLock && (
             <div className="my-lock-banner">
@@ -273,7 +342,8 @@ export default function Editor({ user, project: initialProject, onBack }) {
             ].map(t => (
                 <button key={t.id} title={t.label}
                         className={`tool-btn ${tool === t.id ? "active" : ""}`}
-                        onClick={() => setTool(t.id)}>
+                        onClick={() => !viewOnly && setTool(t.id)}
+                        style={viewOnly ? { opacity: 0.4, cursor: "not-allowed" } : undefined}>
                   {t.icon}
                 </button>
             ))}
@@ -312,7 +382,7 @@ export default function Editor({ user, project: initialProject, onBack }) {
               shapes={activeShapes}
               tool={tool}
               myColor={fillColor}
-              locked={lockedByOther}
+              locked={lockedByOther || viewOnly}
               onAcquireLock={tryAcquireLock}
               onShapeAdd={handleShapeAdd}
               onShapeUpdate={handleShapeUpdate}

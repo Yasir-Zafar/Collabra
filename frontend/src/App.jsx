@@ -2,6 +2,7 @@ import { useState, useEffect } from "react";
 import AuthScreen from "./AuthScreen";
 import Dashboard from "./Dashboard";
 import Editor from "./Editor";
+import { connectSocketWithToken, disconnectSocket } from "./socket";
 import "./index.css";
 
 export default function App() {
@@ -26,13 +27,16 @@ export default function App() {
 
         if (res.ok) {
           const data = await res.json();
+          connectSocketWithToken(token);
           setUser(data.user);
         } else {
           localStorage.removeItem("authToken");
+          disconnectSocket();
         }
       } catch (err) {
         console.error("Auth check error:", err);
         localStorage.removeItem("authToken");
+        disconnectSocket();
       } finally {
         setLoading(false);
       }

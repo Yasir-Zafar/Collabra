@@ -2,6 +2,7 @@ import { useRef, useState, useEffect } from "react";
 import { v4 as uuidv4 } from "uuid";
 
 export default function Canvas({ shapes, tool, myColor, locked, onAcquireLock, onShapeAdd, onShapeUpdate, onShapeMoveStart, onShapeDelete }) {
+  const safeShapes = Array.isArray(shapes) ? shapes : [];
   const svgRef  = useRef(null);
   const wrapRef = useRef(null);
   const [size, setSize]     = useState({ w: 900, h: 600 });
@@ -26,8 +27,8 @@ export default function Canvas({ shapes, tool, myColor, locked, onAcquireLock, o
   }
 
   function hitTest(pos) {
-    for (let i = shapes.length - 1; i >= 0; i--) {
-      const s = shapes[i];
+    for (let i = safeShapes.length - 1; i >= 0; i--) {
+      const s = safeShapes[i];
       if (s.type === "rect" || s.type === "diamond" || s.type === "image") {
         if (pos.x >= s.x && pos.x <= s.x + s.w && pos.y >= s.y && pos.y <= s.y + s.h) return s.id;
       } else if (s.type === "ellipse") {
@@ -59,7 +60,7 @@ export default function Canvas({ shapes, tool, myColor, locked, onAcquireLock, o
       if (hit) {
         if (!onAcquireLock()) return;
         onShapeMoveStart && onShapeMoveStart(hit);
-        const s = shapes.find(x => x.id === hit);
+        const s = safeShapes.find(x => x.id === hit);
         const ox = pos.x - (s.x ?? s.cx ?? s.x1);
         const oy = pos.y - (s.y ?? s.cy ?? s.y1);
         setDragging({ shapeId: hit, ox, oy });
@@ -98,7 +99,7 @@ export default function Canvas({ shapes, tool, myColor, locked, onAcquireLock, o
     const pos = getPos(e);
 
     if (dragging) {
-      const s = shapes.find(x => x.id === dragging.shapeId);
+      const s = safeShapes.find(x => x.id === dragging.shapeId);
       if (!s) return;
       let changes = {};
       if (s.type === "rect" || s.type === "diamond" || s.type === "image") {
@@ -199,7 +200,7 @@ export default function Canvas({ shapes, tool, myColor, locked, onAcquireLock, o
             </pattern>
           </defs>
           <rect width="100%" height="100%" fill="url(#grid)" />
-          {shapes.map(s => renderShape(s))}
+          {safeShapes.map(s => renderShape(s))}
           {drawing && renderShape(drawing.shape, true)}
         </svg>
       </div>
