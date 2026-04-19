@@ -24,6 +24,11 @@ export default function Dashboard({ user, onOpen }) {
     setNewName("");
   }
 
+  function handleLogout() {
+    localStorage.removeItem("authToken");
+    window.location.reload();
+  }
+
   const BG_COLORS = ["#6366f1","#f59e0b","#10b981","#ef4444","#3b82f6"];
 
   return (
@@ -33,9 +38,12 @@ export default function Dashboard({ user, onOpen }) {
           <span className="logo-icon">✦</span>
           <span className="logo-text">Collabra</span>
         </div>
-        <div className="dash-user">
-          <div className="avatar">{user.userName[0].toUpperCase()}</div>
-          <span>{user.userName}</span>
+        <div style={{ display: "flex", alignItems: "center", gap: "16px" }}>
+          <div className="dash-user">
+            <div className="avatar">{user.userName[0].toUpperCase()}</div>
+            <span>{user.userName}</span>
+          </div>
+          <button className="btn-ghost" onClick={handleLogout}>Logout</button>
         </div>
       </header>
 
