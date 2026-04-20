@@ -18,7 +18,8 @@ app.use(express.json());
 
 const server = http.createServer(app);
 const io = new Server(server, {
-  cors: { origin: "http://localhost:5173", methods: ["GET", "POST"] },
+  // In dev, Vite may run on different localhost ports; allow any origin.
+  cors: { origin: true, methods: ["GET", "POST"] },
 });
 
 // ── Hash password utilities ────────────────────────────────────────────
