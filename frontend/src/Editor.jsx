@@ -16,6 +16,7 @@ export default function Editor({ user, project: initialProject, onBack }) {
   const [fillColor, setFillColor]       = useState("#6366f1");
   const [toasts, setToasts]             = useState([]);
   const [membersOpen, setMembersOpen]   = useState(false);
+  const [acquiring, setAcquiring]       = useState(false);
   const toastId    = useRef(0);
   const historyRef = useRef({}); // { [fileId]: { past[], future[] } }
   const joinedRef  = useRef(false);
@@ -90,6 +91,7 @@ export default function Editor({ user, project: initialProject, onBack }) {
 
     socket.on("lock_acquired", ({ fileId, userId, userName, color }) => {
       setLocks(l => ({ ...l, [fileId]: { userId, userName, color } }));
+      setAcquiring(false);
       if (userId !== user.userId) toast(`${userName} started editing`);
     });
 
@@ -138,6 +140,7 @@ export default function Editor({ user, project: initialProject, onBack }) {
   const iHaveLock     = activeLock?.userId === user.userId;
   const lockedByOther = !!(activeLock && activeLock.userId !== user.userId);
   const viewOnly      = myRole !== "editor";
+  const canRequestLock = !viewOnly && !iHaveLock && !lockedByOther;
 
   function tryAcquireLock() {
     if (viewOnly) { toast("View only"); return false; }
@@ -183,7 +186,7 @@ export default function Editor({ user, project: initialProject, onBack }) {
 
   // ── Shapes ────────────────────────────────────────────────────────────────
   function handleShapeAdd(shape) {
-    if (!tryAcquireLock()) return;
+    if (!iHaveLock) { toast("Acquire the lock to edit"); return; }
     snapshotBefore();
     setProject(p => addShape(p, activeFileId, shape));
     socket.emit("shape_add", { fileId: activeFileId, shape });
@@ -198,7 +201,7 @@ export default function Editor({ user, project: initialProject, onBack }) {
   function handleShapeMoveStart() { snapshotBefore(); }
 
   function handleShapeDelete(shapeId) {
-    if (!iHaveLock) { toast("Acquire the lock first to delete"); return; }
+    if (!iHaveLock) { toast("Acquire the lock to edit"); return; }
     snapshotBefore();
     setProject(p => deleteShape(p, activeFileId, shapeId));
     socket.emit("shape_delete", { fileId: activeFileId, shapeId });
@@ -266,6 +269,7 @@ export default function Editor({ user, project: initialProject, onBack }) {
   const canUndo      = iHaveLock && h.past.length > 0;
   const canRedo      = iHaveLock && h.future.length > 0;
   const isOwner      = String(project.ownerId) === String(user.userId);
+  const editingLabel = lockedByOther ? `${activeLock.userName}` : iHaveLock ? "You" : "No one";
 
   return (
       <div className="editor-bg">
@@ -311,6 +315,29 @@ export default function Editor({ user, project: initialProject, onBack }) {
                   </div>
               ))}
             </div>
+          </div>
+        </div>
+
+        {/* Collab bar (explicit lock control) */}
+        <div className="collab-bar">
+          <div className="collab-left">
+            <span className="collab-pill">Watching: {activeUsers.length}</span>
+            <span className="collab-pill">Editing: {editingLabel}</span>
+          </div>
+          <div className="collab-right">
+            {viewOnly ? (
+              <span className="collab-muted">View only</span>
+            ) : iHaveLock ? (
+              <button className="btn-release" onClick={releaseLock}>Release lock</button>
+            ) : (
+              <button
+                className="btn-primary"
+                onClick={() => { setAcquiring(true); tryAcquireLock(); }}
+                disabled={!canRequestLock || acquiring}
+              >
+                {acquiring ? "Acquiring…" : lockedByOther ? "Locked" : "Acquire lock"}
+              </button>
+            )}
           </div>
         </div>
 
@@ -395,8 +422,7 @@ export default function Editor({ user, project: initialProject, onBack }) {
               shapes={activeShapes}
               tool={tool}
               myColor={fillColor}
-              locked={lockedByOther || viewOnly}
-              onAcquireLock={tryAcquireLock}
+              locked={lockedByOther || viewOnly || !iHaveLock}
               onShapeAdd={handleShapeAdd}
               onShapeUpdate={handleShapeUpdate}
               onShapeMoveStart={handleShapeMoveStart}

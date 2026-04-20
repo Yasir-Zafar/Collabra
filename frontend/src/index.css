@@ -221,6 +221,27 @@ body {
   background: transparent; color: #ef4444; cursor: pointer; font-size: 12px; font-family: inherit;
 }
 .btn-release:hover { background: #ef444422; }
+.collab-bar {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 12px;
+  padding: 8px 16px;
+  background: #0f172a;
+  border-bottom: 1px solid #1e293b;
+  flex-shrink: 0;
+}
+.collab-left { display: flex; align-items: center; gap: 8px; flex-wrap: wrap; }
+.collab-right { display: flex; align-items: center; gap: 8px; }
+.collab-pill {
+  font-size: 12px;
+  color: #94a3b8;
+  border: 1px solid #334155;
+  background: rgba(15, 23, 42, 0.6);
+  border-radius: 999px;
+  padding: 4px 10px;
+}
+.collab-muted { font-size: 12px; color: #64748b; }
 .editor-body { display: flex; flex: 1; overflow: hidden; }
 .toolbar {
   width: 52px; background: #1e293b; border-right: 1px solid #334155;

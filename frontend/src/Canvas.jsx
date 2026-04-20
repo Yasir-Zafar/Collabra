@@ -1,7 +1,7 @@
 import { useRef, useState, useEffect } from "react";
 import { v4 as uuidv4 } from "uuid";
 
-export default function Canvas({ shapes, tool, myColor, locked, onAcquireLock, onShapeAdd, onShapeUpdate, onShapeMoveStart, onShapeDelete }) {
+export default function Canvas({ shapes, tool, myColor, locked, onShapeAdd, onShapeUpdate, onShapeMoveStart, onShapeDelete }) {
   const safeShapes = Array.isArray(shapes) ? shapes : [];
   const svgRef  = useRef(null);
   const wrapRef = useRef(null);
@@ -51,14 +51,13 @@ export default function Canvas({ shapes, tool, myColor, locked, onAcquireLock, o
   }
 
   function onMouseDown(e) {
-    if (locked) return;
     const pos = getPos(e);
 
     if (tool === "select") {
       const hit = hitTest(pos);
       setSelected(hit);
       if (hit) {
-        if (!onAcquireLock()) return;
+        if (locked) return;
         onShapeMoveStart && onShapeMoveStart(hit);
         const s = safeShapes.find(x => x.id === hit);
         const ox = pos.x - (s.x ?? s.cx ?? s.x1);
@@ -69,11 +68,13 @@ export default function Canvas({ shapes, tool, myColor, locked, onAcquireLock, o
     }
 
     if (tool === "delete") {
+      if (locked) return;
       const hit = hitTest(pos);
       if (hit) onShapeDelete(hit);
       return;
     }
 
+    if (locked) return;
     let shape = null;
     if (tool === "rect") {
       shape = { id: uuidv4(), type:"rect", x:pos.x, y:pos.y, w:2, h:2, fill:myColor, stroke:"#334155", sw:2 };
@@ -90,7 +91,6 @@ export default function Canvas({ shapes, tool, myColor, locked, onAcquireLock, o
     }
 
     if (shape) {
-      if (!onAcquireLock()) return;
       setDrawing({ shape, startX: pos.x, startY: pos.y });
     }
   }
@@ -99,6 +99,7 @@ export default function Canvas({ shapes, tool, myColor, locked, onAcquireLock, o
     const pos = getPos(e);
 
     if (dragging) {
+      if (locked) return;
       const s = safeShapes.find(x => x.id === dragging.shapeId);
       if (!s) return;
       let changes = {};
