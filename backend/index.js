@@ -268,6 +268,7 @@ app.get("/projects", verifyToken, async (req, res) => {
       SELECT
         p.id,
         p.name,
+        p.owner_id,
         u.display_name AS owner_name,
         COALESCE(pm.role, 'viewer'::project_role) AS my_role,
         (SELECT COUNT(*)::int FROM project_files f WHERE f.project_id = p.id) AS file_count
@@ -281,6 +282,8 @@ app.get("/projects", verifyToken, async (req, res) => {
     res.json(rows.map(r => ({
       id: r.id,
       name: r.name,
+      ownerId: idToString(r.owner_id),
+      isOwner: String(r.owner_id) === String(userId),
       ownerName: r.owner_name,
       fileCount: r.file_count,
       myRole: r.my_role,
@@ -317,6 +320,7 @@ app.post("/projects", verifyToken, async (req, res) => {
       id: project[0].id,
       name: project[0].name,
       ownerId: idToString(project[0].owner_id),
+      isOwner: true,
       ownerName: owner[0]?.display_name ?? req.user.displayName,
       files: { [file[0].id]: { id: file[0].id, name: file[0].name, shapes: [] } },
       myRole: "editor",

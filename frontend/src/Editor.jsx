@@ -425,6 +425,7 @@ export default function Editor({ user, project: initialProject, onBack }) {
               { id:"ellipse", icon:"○", label:"Ellipse" },
               { id:"diamond", icon:"◇", label:"Diamond" },
               { id:"line",    icon:"╱", label:"Line" },
+              { id:"brush",   icon:"✎", label:"Brush" },
               { id:"text",    icon:"T", label:"Text" },
               { id:"delete",  icon:"✕", label:"Delete shape" },
             ].map(t => (

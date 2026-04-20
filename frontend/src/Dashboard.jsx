@@ -44,8 +44,33 @@ export default function Dashboard({ user, onOpen }) {
       return;
     }
     const project = await res.json();
-    setProjects(p => [...p, { id: project.id, name: project.name, ownerName: project.ownerName, fileCount: 1 }]);
+    setProjects(p => [...p, {
+      id: project.id,
+      name: project.name,
+      ownerId: project.ownerId,
+      isOwner: true,
+      ownerName: project.ownerName,
+      fileCount: 1,
+      myRole: "editor",
+    }]);
     setNewName("");
+  }
+
+  async function deleteProject(projectId) {
+    const ok = window.confirm("Delete this project permanently?");
+    if (!ok) return;
+    const token = localStorage.getItem("authToken");
+    const res = await fetch(`${API_BASE}/projects/${projectId}`, {
+      method: "DELETE",
+      headers: withApiHeaders({ "Authorization": `Bearer ${token}` }),
+    });
+    if (res.status === 401) {
+      localStorage.removeItem("authToken");
+      window.location.reload();
+      return;
+    }
+    if (!res.ok) return;
+    setProjects(p => p.filter(x => String(x.id) !== String(projectId)));
   }
 
   function handleLogout() {
@@ -96,7 +121,17 @@ export default function Dashboard({ user, onOpen }) {
                   <span className="project-thumb-letter">{p.name[0]}</span>
                 </div>
                 <div className="project-info">
-                  <div className="project-name">{p.name}</div>
+                  <div className="project-name-row">
+                    <div className="project-name">{p.name}</div>
+                    {p.isOwner && (
+                      <button
+                        className="btn-danger btn-danger-sm"
+                        onClick={(e) => { e.stopPropagation(); deleteProject(p.id); }}
+                      >
+                        Delete
+                      </button>
+                    )}
+                  </div>
                   <div className="project-meta">{p.fileCount} page{p.fileCount !== 1 ? "s" : ""} · by {p.ownerName}</div>
                 </div>
               </div>

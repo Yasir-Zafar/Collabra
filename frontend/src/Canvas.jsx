@@ -36,6 +36,11 @@ export default function Canvas({ shapes, tool, myColor, locked, onShapeAdd, onSh
         if (dx*dx + dy*dy <= 1) return s.id;
       } else if (s.type === "line") {
         if (ptSegDist(pos, {x:s.x1,y:s.y1}, {x:s.x2,y:s.y2}) < 8) return s.id;
+      } else if (s.type === "brush") {
+        const pts = Array.isArray(s.points) ? s.points : [];
+        for (let p = 0; p < pts.length - 1; p++) {
+          if (ptSegDist(pos, pts[p], pts[p + 1]) < Math.max(8, (s.sw || 3) + 3)) return s.id;
+        }
       } else if (s.type === "text") {
         if (pos.x >= s.x && pos.x <= s.x+200 && pos.y >= s.y-s.fontSize && pos.y <= s.y+6) return s.id;
       }
@@ -84,6 +89,8 @@ export default function Canvas({ shapes, tool, myColor, locked, onShapeAdd, onSh
       shape = { id: uuidv4(), type:"line", x1:pos.x, y1:pos.y, x2:pos.x, y2:pos.y, stroke:myColor, sw:3 };
     } else if (tool === "diamond") {
       shape = { id: uuidv4(), type:"diamond", x:pos.x, y:pos.y, w:2, h:2, fill:myColor, stroke:"#334155", sw:2 };
+    } else if (tool === "brush") {
+      shape = { id: uuidv4(), type:"brush", points:[{ x: pos.x, y: pos.y }], stroke: myColor, sw: 3 };
     } else if (tool === "text") {
       const text = window.prompt("Enter text:", "Label");
       if (text) onShapeAdd({ id: uuidv4(), type:"text", x:pos.x, y:pos.y, text, fontSize:20, fill:myColor });
@@ -127,6 +134,9 @@ export default function Canvas({ shapes, tool, myColor, locked, onShapeAdd, onSh
         updated = { ...shape, rx: Math.max(2,Math.abs(dx)), ry: Math.max(2,Math.abs(dy)) };
       } else if (shape.type === "line") {
         updated = { ...shape, x2: pos.x, y2: pos.y };
+      } else if (shape.type === "brush") {
+        const points = Array.isArray(shape.points) ? shape.points : [];
+        updated = { ...shape, points: [...points, { x: pos.x, y: pos.y }] };
       }
       setDrawing(d => ({ ...d, shape: updated }));
     }
@@ -165,6 +175,22 @@ export default function Canvas({ shapes, tool, myColor, locked, onShapeAdd, onSh
               stroke={sel ? selColor : s.stroke} strokeWidth={sel ? 3 : s.sw}
               strokeLinecap="round" style={mv} />
     );
+    if (s.type === "brush") {
+      const points = Array.isArray(s.points) ? s.points : [];
+      if (!points.length) return null;
+      return (
+        <polyline
+          key={s.id}
+          points={points.map(p => `${p.x},${p.y}`).join(" ")}
+          fill="none"
+          stroke={sel ? selColor : s.stroke}
+          strokeWidth={sel ? (s.sw || 3) + 1 : (s.sw || 3)}
+          strokeLinecap="round"
+          strokeLinejoin="round"
+          style={mv}
+        />
+      );
+    }
     if (s.type === "text") return (
         <text key={s.id} x={s.x} y={s.y} fontSize={s.fontSize} fill={s.fill}
               fontFamily="system-ui,sans-serif" style={mv}
