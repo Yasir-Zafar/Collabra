@@ -1,5 +1,7 @@
 import { io } from "socket.io-client";
-export const socket = io("http://localhost:3001", { autoConnect: false });
+import { API_BASE } from "./config";
+
+export const socket = io(API_BASE, { autoConnect: false });
 
 export function connectSocketWithToken(token) {
   // Ensure a fresh auth handshake (important after logout/login)

@@ -1,5 +1,6 @@
 import { useEffect, useRef, useState } from "react";
 import { connectSocketWithToken } from "./socket";
+import { API_BASE } from "./config";
 
 export default function AuthScreen({ onLogin }) {
   const [mode, setMode] = useState("login"); // "login" or "signup"
@@ -33,7 +34,7 @@ export default function AuthScreen({ onLogin }) {
             try {
               setErr("");
               setLoading(true);
-              const res = await fetch("http://localhost:3001/auth/google", {
+            const res = await fetch(`${API_BASE}/auth/google`, {
                 method: "POST",
                 headers: { "Content-Type": "application/json" },
                 body: JSON.stringify({ credential: response.credential }),
@@ -96,7 +97,7 @@ export default function AuthScreen({ onLogin }) {
         ? { email, password }
         : { email, displayName, password };
 
-      const res = await fetch(`http://localhost:3001${url}`, {
+      const res = await fetch(`${API_BASE}${url}`, {
         method: "POST",
         headers: { "Content-Type": "application/json" },
         body: JSON.stringify(body),

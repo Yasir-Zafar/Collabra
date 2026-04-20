@@ -1,4 +1,5 @@
 import { useEffect, useMemo, useState } from "react";
+import { API_BASE } from "./config";
 
 export default function MembersModal({ open, onClose, projectId, isOwner }) {
   const [members, setMembers] = useState([]);
@@ -15,7 +16,7 @@ export default function MembersModal({ open, onClose, projectId, isOwner }) {
     setErr("");
     setLoading(true);
     try {
-      const res = await fetch(`http://localhost:3001/projects/${projectId}/members`, {
+      const res = await fetch(`${API_BASE}/projects/${projectId}/members`, {
         headers: { Authorization: `Bearer ${token}` },
       });
       const data = await res.json();
@@ -49,7 +50,7 @@ export default function MembersModal({ open, onClose, projectId, isOwner }) {
     setInviteLoading(true);
     setErr("");
     try {
-      const res = await fetch(`http://localhost:3001/projects/${projectId}/members`, {
+      const res = await fetch(`${API_BASE}/projects/${projectId}/members`, {
         method: "POST",
         headers: {
           "Content-Type": "application/json",
@@ -71,7 +72,7 @@ export default function MembersModal({ open, onClose, projectId, isOwner }) {
   async function updateRole(userId, role) {
     setErr("");
     try {
-      const res = await fetch(`http://localhost:3001/projects/${projectId}/members/${userId}`, {
+      const res = await fetch(`${API_BASE}/projects/${projectId}/members/${userId}`, {
         method: "PATCH",
         headers: {
           "Content-Type": "application/json",
@@ -90,7 +91,7 @@ export default function MembersModal({ open, onClose, projectId, isOwner }) {
   async function removeMember(userId) {
     setErr("");
     try {
-      const res = await fetch(`http://localhost:3001/projects/${projectId}/members/${userId}`, {
+      const res = await fetch(`${API_BASE}/projects/${projectId}/members/${userId}`, {
         method: "DELETE",
         headers: { Authorization: `Bearer ${token}` },
       });

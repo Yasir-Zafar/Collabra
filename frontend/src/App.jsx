@@ -3,6 +3,7 @@ import AuthScreen from "./AuthScreen";
 import Dashboard from "./Dashboard";
 import Editor from "./Editor";
 import { connectSocketWithToken, disconnectSocket } from "./socket";
+import { API_BASE } from "./config";
 import "./index.css";
 
 export default function App() {
@@ -20,7 +21,7 @@ export default function App() {
       }
 
       try {
-        const res = await fetch("http://localhost:3001/auth/verify", {
+        const res = await fetch(`${API_BASE}/auth/verify`, {
           method: "POST",
           headers: { "Authorization": `Bearer ${token}` },
         });

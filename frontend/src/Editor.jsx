@@ -2,6 +2,7 @@ import { useState, useEffect, useCallback, useRef } from "react";
 import { socket } from "./socket";
 import Canvas from "./Canvas";
 import MembersModal from "./MembersModal";
+import { API_BASE } from "./config";
 
 const PRESET_COLORS = ["#6366f1","#ef4444","#f59e0b","#10b981","#3b82f6","#ec4899","#1e293b","#ffffff"];
 
@@ -52,7 +53,7 @@ export default function Editor({ user, project: initialProject, onBack }) {
     async function loadViaRest() {
       try {
         const token = localStorage.getItem("authToken");
-        const res = await fetch(`http://localhost:3001/projects/${initialProject.id}`, {
+        const res = await fetch(`${API_BASE}/projects/${initialProject.id}`, {
           headers: { "Authorization": `Bearer ${token}` },
         });
         if (res.status === 401) { forceRelogin(); return; }

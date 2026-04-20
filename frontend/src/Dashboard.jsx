@@ -1,4 +1,5 @@
 import { useState, useEffect } from "react";
+import { API_BASE } from "./config";
 
 export default function Dashboard({ user, onOpen }) {
   const [projects, setProjects] = useState([]);
@@ -7,7 +8,7 @@ export default function Dashboard({ user, onOpen }) {
 
   useEffect(() => {
     const token = localStorage.getItem("authToken");
-    fetch("http://localhost:3001/projects", {
+    fetch(`${API_BASE}/projects`, {
       headers: { "Authorization": `Bearer ${token}` },
     })
       .then(async (r) => {
@@ -29,7 +30,7 @@ export default function Dashboard({ user, onOpen }) {
     const trimmed = newName.trim();
     if (!trimmed) return;
     const token = localStorage.getItem("authToken");
-    const res = await fetch("http://localhost:3001/projects", {
+    const res = await fetch(`${API_BASE}/projects`, {
       method: "POST",
       headers: {
         "Content-Type": "application/json",
