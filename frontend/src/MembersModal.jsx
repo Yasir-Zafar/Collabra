@@ -1,5 +1,6 @@
 import { useEffect, useMemo, useState } from "react";
 import { API_BASE } from "./config";
+import { socket } from "./socket";
 
 export default function MembersModal({ open, onClose, projectId, isOwner }) {
   const [members, setMembers] = useState([]);
@@ -32,6 +33,18 @@ export default function MembersModal({ open, onClose, projectId, isOwner }) {
   useEffect(() => {
     if (!open) return;
     loadMembers();
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [open, projectId]);
+
+  useEffect(() => {
+    if (!open) return;
+    function onMembersUpdated(payload) {
+      if (!payload?.projectId) return;
+      if (String(payload.projectId) !== String(projectId)) return;
+      loadMembers();
+    }
+    socket.on("members_updated", onMembersUpdated);
+    return () => socket.off("members_updated", onMembersUpdated);
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [open, projectId]);
 

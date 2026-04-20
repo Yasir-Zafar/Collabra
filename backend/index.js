@@ -404,6 +404,8 @@ app.post("/projects/:projectId/members", verifyToken, async (req, res) => {
       VALUES (${projectId}, ${u[0].id}, ${safeRole}::project_role)
       ON CONFLICT (project_id, user_id) DO UPDATE SET role = EXCLUDED.role
     `;
+    io.to(String(projectId)).emit("members_updated", { projectId: String(projectId) });
+    io.to(`user:${idToString(u[0].id)}`).emit("members_updated", { projectId: String(projectId) });
     res.json({ ok: true, userId: u[0].id, userName: u[0].display_name, email: u[0].email, role: safeRole });
   } catch (err) {
     console.error("Invite member error:", err);
@@ -431,6 +433,8 @@ app.patch("/projects/:projectId/members/:userId", verifyToken, async (req, res) 
       RETURNING user_id, role
     `;
     if (!updated.length) return res.status(404).json({ error: "Member not found" });
+    io.to(String(projectId)).emit("members_updated", { projectId: String(projectId) });
+    io.to(`user:${String(targetUserId)}`).emit("members_updated", { projectId: String(projectId) });
     res.json({ ok: true, userId: updated[0].user_id, role: updated[0].role });
   } catch (err) {
     console.error("Update member role error:", err);
@@ -453,6 +457,8 @@ app.delete("/projects/:projectId/members/:userId", verifyToken, async (req, res)
       DELETE FROM project_members
       WHERE project_id = ${projectId} AND user_id = ${targetUserId}
     `;
+    io.to(String(projectId)).emit("members_updated", { projectId: String(projectId) });
+    io.to(`user:${String(targetUserId)}`).emit("members_updated", { projectId: String(projectId) });
     res.json({ ok: true });
   } catch (err) {
     console.error("Kick member error:", err);
@@ -486,6 +492,7 @@ io.use((socket, next) => {
 
 io.on("connection", (socket) => {
   console.log("+ connected:", socket.id);
+  socket.join(`user:${socket.user.userId}`);
 
   socket.on("join_project", async ({ projectId }) => {
     const userId = socket.user.userId;
