@@ -1,5 +1,5 @@
 import { useState, useEffect } from "react";
-import { API_BASE } from "./config";
+import { API_BASE, withApiHeaders } from "./config";
 
 export default function Dashboard({ user, onOpen }) {
   const [projects, setProjects] = useState([]);
@@ -9,7 +9,7 @@ export default function Dashboard({ user, onOpen }) {
   useEffect(() => {
     const token = localStorage.getItem("authToken");
     fetch(`${API_BASE}/projects`, {
-      headers: { "Authorization": `Bearer ${token}` },
+      headers: withApiHeaders({ "Authorization": `Bearer ${token}` }),
     })
       .then(async (r) => {
         if (r.status === 401) {
@@ -32,10 +32,10 @@ export default function Dashboard({ user, onOpen }) {
     const token = localStorage.getItem("authToken");
     const res = await fetch(`${API_BASE}/projects`, {
       method: "POST",
-      headers: {
+      headers: withApiHeaders({
         "Content-Type": "application/json",
         "Authorization": `Bearer ${token}`,
-      },
+      }),
       body: JSON.stringify({ name: trimmed }),
     });
     if (res.status === 401) {

@@ -1,5 +1,5 @@
 import { useEffect, useMemo, useState } from "react";
-import { API_BASE } from "./config";
+import { API_BASE, withApiHeaders } from "./config";
 import { socket } from "./socket";
 
 export default function MembersModal({ open, onClose, projectId, isOwner }) {
@@ -18,7 +18,7 @@ export default function MembersModal({ open, onClose, projectId, isOwner }) {
     setLoading(true);
     try {
       const res = await fetch(`${API_BASE}/projects/${projectId}/members`, {
-        headers: { Authorization: `Bearer ${token}` },
+        headers: withApiHeaders({ Authorization: `Bearer ${token}` }),
       });
       const data = await res.json();
       if (!res.ok) throw new Error(data?.error || "Failed to load members");
@@ -65,10 +65,10 @@ export default function MembersModal({ open, onClose, projectId, isOwner }) {
     try {
       const res = await fetch(`${API_BASE}/projects/${projectId}/members`, {
         method: "POST",
-        headers: {
+        headers: withApiHeaders({
           "Content-Type": "application/json",
           Authorization: `Bearer ${token}`,
-        },
+        }),
         body: JSON.stringify({ email, role: inviteRole }),
       });
       const data = await res.json();
@@ -87,10 +87,10 @@ export default function MembersModal({ open, onClose, projectId, isOwner }) {
     try {
       const res = await fetch(`${API_BASE}/projects/${projectId}/members/${userId}`, {
         method: "PATCH",
-        headers: {
+        headers: withApiHeaders({
           "Content-Type": "application/json",
           Authorization: `Bearer ${token}`,
-        },
+        }),
         body: JSON.stringify({ role }),
       });
       const data = await res.json();
@@ -106,7 +106,7 @@ export default function MembersModal({ open, onClose, projectId, isOwner }) {
     try {
       const res = await fetch(`${API_BASE}/projects/${projectId}/members/${userId}`, {
         method: "DELETE",
-        headers: { Authorization: `Bearer ${token}` },
+        headers: withApiHeaders({ Authorization: `Bearer ${token}` }),
       });
       const data = await res.json();
       if (!res.ok) throw new Error(data?.error || "Failed to remove member");
