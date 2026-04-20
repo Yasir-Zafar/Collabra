@@ -9,6 +9,7 @@ const { Server } = require("socket.io");
 const cors = require("cors");
 const { v4: uuidv4 } = require("uuid");
 const crypto = require("crypto");
+const { OAuth2Client } = require("google-auth-library");
 const sql = require("./db.js");
 
 const app = express();
@@ -35,6 +36,8 @@ const locks = {};     // fileId  -> { userId, userName, color, socketId }
 const tokens = {};    // token -> { userId, email, displayName, createdAt }
 const saveTimers = {}; // fileId -> Timeout (debounced DB snapshot writes)
 const fileStates = {}; // fileId -> shapes[] (in-memory working set for debounce)
+
+const googleClient = process.env.GOOGLE_CLIENT_ID ? new OAuth2Client(process.env.GOOGLE_CLIENT_ID) : null;
 
 const COLORS = ["#6366f1","#f59e0b","#10b981","#ef4444","#3b82f6","#ec4899","#14b8a6","#f97316"];
 const assignedColors = {};
@@ -213,6 +216,47 @@ app.post("/auth/login", async (req, res) => {
   }
 });
 
+// Google Sign-In (ID token)
+app.post("/auth/google", async (req, res) => {
+  const { credential } = req.body || {};
+  if (!credential) return res.status(400).json({ error: "Missing credential" });
+  if (!googleClient) return res.status(500).json({ error: "Google auth not configured" });
+
+  try {
+    const ticket = await googleClient.verifyIdToken({
+      idToken: credential,
+      audience: process.env.GOOGLE_CLIENT_ID,
+    });
+    const payload = ticket.getPayload();
+    const email = payload?.email;
+    const displayName = payload?.name || payload?.given_name || "User";
+    const emailVerified = payload?.email_verified;
+
+    if (!email) return res.status(401).json({ error: "Google token missing email" });
+    if (emailVerified === false) return res.status(401).json({ error: "Google email not verified" });
+
+    // Find or create user. We don't require any DB schema changes; we set a random password for Google users.
+    let users = await sql`SELECT id, email, display_name FROM users WHERE email = ${email} LIMIT 1`;
+    if (!users.length) {
+      const randomSecret = uuidv4() + ":" + String(payload?.sub || "");
+      const passwordHash = hashPassword(randomSecret);
+      users = await sql`
+        INSERT INTO users (email, display_name, password)
+        VALUES (${email}, ${displayName}, ${passwordHash})
+        RETURNING id, email, display_name
+      `;
+    }
+
+    const u = users[0];
+    const token = uuidv4();
+    tokens[token] = { userId: idToString(u.id), email: u.email, displayName: u.display_name };
+    res.json({ token, user: { userId: idToString(u.id), userName: u.display_name, email: u.email } });
+  } catch (err) {
+    console.error("Google auth error:", err);
+    res.status(401).json({ error: "Google authentication failed" });
+  }
+});
+
 // Verify token route
 app.post("/auth/verify", verifyToken, (req, res) => {
   res.json({ user: { userId: idToString(req.user.userId), userName: req.user.displayName, email: req.user.email } });
@@ -295,6 +339,48 @@ app.get("/projects/:projectId", verifyToken, async (req, res) => {
   } catch (err) {
     console.error("Get project error:", err);
     res.status(500).json({ error: "Failed to load project" });
+  }
+});
+
+// Members: list members (owner + collaborators)
+app.get("/projects/:projectId/members", verifyToken, async (req, res) => {
+  const projectId = req.params.projectId;
+  const userId = req.user.userId;
+  try {
+    // Ensure caller has access to the project.
+    const loaded = await loadProjectForUser({ projectId, userId });
+    if (!loaded) return res.status(404).json({ error: "Project not found" });
+
+    const rows = await sql`
+      SELECT
+        u.id as user_id,
+        u.display_name,
+        u.email,
+        COALESCE(pm.role, 'viewer'::project_role) as role,
+        (p.owner_id = u.id) as is_owner
+      FROM projects p
+      JOIN users u
+        ON (u.id = p.owner_id)
+        OR EXISTS (
+          SELECT 1 FROM project_members pm2
+          WHERE pm2.project_id = p.id AND pm2.user_id = u.id
+        )
+      LEFT JOIN project_members pm
+        ON pm.project_id = p.id AND pm.user_id = u.id
+      WHERE p.id = ${projectId}
+      ORDER BY (p.owner_id = u.id) DESC, u.display_name ASC
+    `;
+
+    res.json(rows.map(r => ({
+      userId: idToString(r.user_id),
+      userName: r.display_name,
+      email: r.email,
+      role: r.is_owner ? "owner" : r.role,
+      isOwner: !!r.is_owner,
+    })));
+  } catch (err) {
+    console.error("List members error:", err);
+    res.status(500).json({ error: "Failed to list members" });
   }
 });
 

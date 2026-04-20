@@ -1,6 +1,7 @@
 import { useState, useEffect, useCallback, useRef } from "react";
 import { socket } from "./socket";
 import Canvas from "./Canvas";
+import MembersModal from "./MembersModal";
 
 const PRESET_COLORS = ["#6366f1","#ef4444","#f59e0b","#10b981","#3b82f6","#ec4899","#1e293b","#ffffff"];
 
@@ -14,6 +15,7 @@ export default function Editor({ user, project: initialProject, onBack }) {
   const [tool, setTool]                 = useState("select");
   const [fillColor, setFillColor]       = useState("#6366f1");
   const [toasts, setToasts]             = useState([]);
+  const [membersOpen, setMembersOpen]   = useState(false);
   const toastId    = useRef(0);
   const historyRef = useRef({}); // { [fileId]: { past[], future[] } }
   const joinedRef  = useRef(false);
@@ -263,6 +265,7 @@ export default function Editor({ user, project: initialProject, onBack }) {
   const h            = getHistory(activeFileId);
   const canUndo      = iHaveLock && h.past.length > 0;
   const canRedo      = iHaveLock && h.future.length > 0;
+  const isOwner      = String(project.ownerId) === String(user.userId);
 
   return (
       <div className="editor-bg">
@@ -290,6 +293,9 @@ export default function Editor({ user, project: initialProject, onBack }) {
           </div>
 
           <div className="top-right">
+            <button className="topbar-btn" onClick={() => setMembersOpen(true)}>
+              Members
+            </button>
             <button className="topbar-btn" onClick={exportCanvas}>Export SVG</button>
             {!viewOnly && (
               <label className="topbar-btn" style={{ cursor:"pointer" }}>
@@ -307,6 +313,13 @@ export default function Editor({ user, project: initialProject, onBack }) {
             </div>
           </div>
         </div>
+
+        <MembersModal
+          open={membersOpen}
+          onClose={() => setMembersOpen(false)}
+          projectId={project.id}
+          isOwner={isOwner}
+        />
 
         {/* Lock banners */}
         {lockedByOther && (
