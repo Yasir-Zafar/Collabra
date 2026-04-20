@@ -9,8 +9,6 @@ const { Server } = require("socket.io");
 const cors = require("cors");
 const { v4: uuidv4 } = require("uuid");
 const crypto = require("crypto");
-const { OAuth2Client } = require("google-auth-library");
-const jwt = require("jsonwebtoken");
 const sql = require("./db.js");
 
 const app = express();
@@ -35,19 +33,9 @@ function idToString(v) {
 // ── In-memory state ──────────────────────────────────────────────────────
 const sessions = {};  // socketId -> { userId, userName, color, projectId }
 const locks = {};     // fileId  -> { userId, userName, color, socketId }
+const tokens = {};    // token -> { userId, email, displayName, createdAt }
 const saveTimers = {}; // fileId -> Timeout (debounced DB snapshot writes)
 const fileStates = {}; // fileId -> shapes[] (in-memory working set for debounce)
-
-const googleClient = process.env.GOOGLE_CLIENT_ID ? new OAuth2Client(process.env.GOOGLE_CLIENT_ID) : null;
-const JWT_SECRET = process.env.JWT_SECRET || "dev-secret-change-me";
-
-function issueJwt({ userId, email, displayName }) {
-  return jwt.sign(
-    { userId: String(userId), email, displayName },
-    JWT_SECRET,
-    { expiresIn: "30d" }
-  );
-}
 
 const COLORS = ["#6366f1","#f59e0b","#10b981","#ef4444","#3b82f6","#ec4899","#14b8a6","#f97316"];
 const assignedColors = {};
@@ -199,13 +187,11 @@ function scheduleSaveFileSnapshot({ fileId, shapes }) {
 // ── Auth middleware ──────────────────────────────────────────────────
 function verifyToken(req, res, next) {
   const token = req.headers.authorization?.split(" ")[1];
-  if (!token) return res.status(401).json({ error: "Unauthorized" });
-  try {
-    req.user = jwt.verify(token, JWT_SECRET);
-    next();
-  } catch {
+  if (!token || !tokens[token]) {
     return res.status(401).json({ error: "Unauthorized" });
   }
+  req.user = tokens[token];
+  next();
 }
 
 // ── REST ─────────────────────────────────────────────────────────────────
@@ -230,7 +216,8 @@ app.post("/auth/signup", async (req, res) => {
       RETURNING id, email, display_name
     `;
 
-    const token = issueJwt({ userId: idToString(user[0].id), email: user[0].email, displayName: user[0].display_name });
+    const token = uuidv4();
+    tokens[token] = { userId: idToString(user[0].id), email: user[0].email, displayName: user[0].display_name };
 
     res.json({ token, user: { userId: idToString(user[0].id), userName: user[0].display_name, email: user[0].email } });
   } catch (err) {
@@ -258,52 +245,13 @@ app.post("/auth/login", async (req, res) => {
       return res.status(401).json({ error: "Invalid email or password" });
     }
 
-    const token = issueJwt({ userId: idToString(user.id), email: user.email, displayName: user.display_name });
+    const token = uuidv4();
+    tokens[token] = { userId: idToString(user.id), email: user.email, displayName: user.display_name };
 
     res.json({ token, user: { userId: idToString(user.id), userName: user.display_name, email: user.email } });
   } catch (err) {
     console.error("Login error:", err);
     res.status(500).json({ error: "Login failed" });
-  }
-});
-
-// Google Sign-In (ID token)
-app.post("/auth/google", async (req, res) => {
-  const { credential } = req.body || {};
-  if (!credential) return res.status(400).json({ error: "Missing credential" });
-  if (!googleClient) return res.status(500).json({ error: "Google auth not configured" });
-
-  try {
-    const ticket = await googleClient.verifyIdToken({
-      idToken: credential,
-      audience: process.env.GOOGLE_CLIENT_ID,
-    });
-    const payload = ticket.getPayload();
-    const email = payload?.email;
-    const displayName = payload?.name || payload?.given_name || "User";
-    const emailVerified = payload?.email_verified;
-
-    if (!email) return res.status(401).json({ error: "Google token missing email" });
-    if (emailVerified === false) return res.status(401).json({ error: "Google email not verified" });
-
-    // Find or create user. We don't require any DB schema changes; we set a random password for Google users.
-    let users = await sql`SELECT id, email, display_name FROM users WHERE email = ${email} LIMIT 1`;
-    if (!users.length) {
-      const randomSecret = uuidv4() + ":" + String(payload?.sub || "");
-      const passwordHash = hashPassword(randomSecret);
-      users = await sql`
-        INSERT INTO users (email, display_name, password)
-        VALUES (${email}, ${displayName}, ${passwordHash})
-        RETURNING id, email, display_name
-      `;
-    }
-
-    const u = users[0];
-    const token = issueJwt({ userId: idToString(u.id), email: u.email, displayName: u.display_name });
-    res.json({ token, user: { userId: idToString(u.id), userName: u.display_name, email: u.email } });
-  } catch (err) {
-    console.error("Google auth error:", err);
-    res.status(401).json({ error: "Google authentication failed" });
   }
 });
 
@@ -531,13 +479,9 @@ app.delete("/projects/:projectId", verifyToken, async (req, res) => {
 // ── Socket.io ────────────────────────────────────────────────────────────
 io.use((socket, next) => {
   const token = socket.handshake.auth?.token;
-  if (!token) return next(new Error("Unauthorized"));
-  try {
-    socket.user = jwt.verify(token, JWT_SECRET);
-    next();
-  } catch {
-    return next(new Error("Unauthorized"));
-  }
+  if (!token || !tokens[token]) return next(new Error("Unauthorized"));
+  socket.user = tokens[token];
+  next();
 });
 
 io.on("connection", (socket) => {
