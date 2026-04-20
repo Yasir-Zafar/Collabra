@@ -57,6 +57,47 @@ function colorFor(userId) {
   return assignedColors[userId];
 }
 
+// ── Per-file presence (watchers) ────────────────────────────────────────────
+// fileId -> [{ userId, userName, color }]
+const activeUsersByFile = {};
+// fileId -> { [userId]: Set(socketId) }
+const userSocketsByFile = {};
+
+function ensureFilePresence(fileId) {
+  if (!activeUsersByFile[fileId]) activeUsersByFile[fileId] = [];
+  if (!userSocketsByFile[fileId]) userSocketsByFile[fileId] = {};
+}
+
+function emitActiveUsersForFile(io, fileId) {
+  io.to(fileId).emit("active-users", activeUsersByFile[fileId] || []);
+}
+
+function removeSocketFromAllFiles(io, socketId) {
+  for (const fileId of Object.keys(userSocketsByFile)) {
+    const usersForFile = userSocketsByFile[fileId] || {};
+    let changed = false;
+
+    for (const userId of Object.keys(usersForFile)) {
+      const set = usersForFile[userId];
+      if (!set?.has(socketId)) continue;
+      set.delete(socketId);
+      changed = true;
+
+      if (set.size === 0) {
+        delete usersForFile[userId];
+        activeUsersByFile[fileId] = (activeUsersByFile[fileId] || []).filter(u => String(u.userId) !== String(userId));
+      }
+    }
+
+    if (changed) emitActiveUsersForFile(io, fileId);
+
+    if (Object.keys(usersForFile).length === 0) {
+      delete userSocketsByFile[fileId];
+      if ((activeUsersByFile[fileId] || []).length === 0) delete activeUsersByFile[fileId];
+    }
+  }
+}
+
 function usersInProject(projectId) {
   return Object.values(sessions)
       .filter(s => s.projectId === projectId)
@@ -526,6 +567,52 @@ io.on("connection", (socket) => {
     console.log(`  ${userName} joined ${projectId} (${loaded.role})`);
   });
 
+  // Join a specific file/page room for presence updates.
+  socket.on("join_file", ({ fileId }) => {
+    const session = sessions[socket.id];
+    const fid = String(fileId || "").trim();
+    if (!session || !fid) return;
+
+    socket.join(fid);
+    ensureFilePresence(fid);
+
+    if (!userSocketsByFile[fid][session.userId]) userSocketsByFile[fid][session.userId] = new Set();
+    userSocketsByFile[fid][session.userId].add(socket.id);
+
+    const existingIdx = activeUsersByFile[fid].findIndex(u => String(u.userId) === String(session.userId));
+    const entry = { userId: session.userId, userName: session.userName, color: session.color };
+    if (existingIdx === -1) activeUsersByFile[fid].push(entry);
+    else activeUsersByFile[fid][existingIdx] = entry;
+
+    emitActiveUsersForFile(io, fid);
+
+    const lock = locks[fid];
+    io.to(fid).emit("editing-user", lock ? lock.userId : null);
+  });
+
+  socket.on("leave_file", ({ fileId }) => {
+    const session = sessions[socket.id];
+    const fid = String(fileId || "").trim();
+    if (!session || !fid) return;
+
+    socket.leave(fid);
+    const usersForFile = userSocketsByFile[fid];
+    if (!usersForFile?.[session.userId]) return;
+
+    usersForFile[session.userId].delete(socket.id);
+    if (usersForFile[session.userId].size === 0) {
+      delete usersForFile[session.userId];
+      activeUsersByFile[fid] = (activeUsersByFile[fid] || []).filter(u => String(u.userId) !== String(session.userId));
+    }
+
+    emitActiveUsersForFile(io, fid);
+
+    if (usersForFile && Object.keys(usersForFile).length === 0) {
+      delete userSocketsByFile[fid];
+      if ((activeUsersByFile[fid] || []).length === 0) delete activeUsersByFile[fid];
+    }
+  });
+
   socket.on("acquire_lock", ({ fileId }) => {
     const session = sessions[socket.id];
     if (!session) return;
@@ -537,6 +624,7 @@ io.on("connection", (socket) => {
     }
     locks[fileId] = { userId: session.userId, userName: session.userName, color: session.color, socketId: socket.id };
     io.to(session.projectId).emit("lock_acquired", { fileId, userId: session.userId, userName: session.userName, color: session.color });
+    io.to(String(fileId)).emit("editing-user", session.userId);
   });
 
   socket.on("release_lock", ({ fileId }) => {
@@ -545,6 +633,7 @@ io.on("connection", (socket) => {
     flushFileSnapshot(fileId);
     delete locks[fileId];
     io.to(session.projectId).emit("lock_released", { fileId });
+    io.to(String(fileId)).emit("editing-user", null);
   });
 
   socket.on("shape_add", ({ fileId, shape }) => {
@@ -610,12 +699,15 @@ io.on("connection", (socket) => {
 
   socket.on("disconnect", () => {
     const session = sessions[socket.id];
+    // Presence cleanup even if they never joined a project.
+    removeSocketFromAllFiles(io, socket.id);
     if (!session) return;
     for (const [fid, lock] of Object.entries(locks)) {
       if (lock.socketId === socket.id) {
         flushFileSnapshot(fid);
         delete locks[fid];
         io.to(session.projectId).emit("lock_released", { fileId: fid });
+        io.to(String(fid)).emit("editing-user", null);
       }
     }
     socket.to(session.projectId).emit("user_left", { userId: session.userId });
@@ -625,4 +717,5 @@ io.on("connection", (socket) => {
   });
 });
 
-server.listen(3001, () => console.log("Server on http://localhost:3001"));
+// Listen on all interfaces so other devices on LAN can connect.
+server.listen(3001, "0.0.0.0", () => console.log("Server on http://localhost:3001"));

@@ -11,6 +11,8 @@ export default function Editor({ user, project: initialProject, onBack }) {
   const [activeFileId, setActiveFileId] = useState(null);
   const [locks, setLocks]               = useState({});
   const [activeUsers, setActiveUsers]   = useState([]);
+  const [fileWatchers, setFileWatchers] = useState([]);
+  const [editingUserId, setEditingUserId] = useState(null);
   const [myRole, setMyRole]             = useState("viewer");
   const [loadErr, setLoadErr]           = useState("");
   const [tool, setTool]                 = useState("select");
@@ -23,6 +25,7 @@ export default function Editor({ user, project: initialProject, onBack }) {
   const historyRef = useRef({}); // { [fileId]: { past[], future[] } }
   const joinedRef  = useRef(false);
   const activeFileIdRef = useRef(null);
+  const joinedFileRef = useRef(null);
 
   function getHistory(fileId) {
     if (!historyRef.current[fileId]) historyRef.current[fileId] = { past: [], future: [] };
@@ -81,6 +84,8 @@ export default function Editor({ user, project: initialProject, onBack }) {
     });
 
     socket.on("users_update", (users) => setActiveUsers(users));
+    socket.on("active-users", (users) => setFileWatchers(Array.isArray(users) ? users : []));
+    socket.on("editing-user", (uid) => setEditingUserId(uid || null));
     socket.on("user_joined",  ({ userName }) => toast(`${userName} joined`));
     socket.on("user_left",    ({ userId })   => setActiveUsers(u => u.filter(x => x.userId !== userId)));
     socket.on("error_msg",    (msg) => toast(String(msg || "Error")));
@@ -137,13 +142,27 @@ export default function Editor({ user, project: initialProject, onBack }) {
       // Flush/cleanup: release any lock we might hold so server persists snapshot.
       const fid = activeFileIdRef.current;
       if (fid) socket.emit("release_lock", { fileId: fid });
-      ["init_state","users_update","user_joined","user_left","lock_acquired","lock_released",
+      ["init_state","users_update","active-users","editing-user","user_joined","user_left","lock_acquired","lock_released",
         "lock_denied","shape_added","shape_updated","shape_deleted","snapshot","file_added","error_msg","connect_error","connect","disconnect"]
           .forEach(ev => socket.off(ev));
       socket.off("connect", joinOnce);
       socket.off("connect_error");
     };
   }, [initialProject.id, user.userId, user.userName, toast]);
+
+  // Join/leave per-file room for watchers + editing status.
+  useEffect(() => {
+    if (!rtStatus.connected) return;
+    if (!activeFileId) return;
+    if (!socket.connected) return;
+
+    const prev = joinedFileRef.current;
+    if (prev && prev !== activeFileId) {
+      socket.emit("leave_file", { fileId: prev });
+    }
+    joinedFileRef.current = activeFileId;
+    socket.emit("join_file", { fileId: activeFileId });
+  }, [activeFileId, rtStatus.connected]);
 
   // ── Undo/redo keybinds ────────────────────────────────────────────────────
   useEffect(() => {
@@ -291,7 +310,11 @@ export default function Editor({ user, project: initialProject, onBack }) {
   const canUndo      = iHaveLock && h.past.length > 0;
   const canRedo      = iHaveLock && h.future.length > 0;
   const isOwner      = String(project.ownerId) === String(user.userId);
-  const editingLabel = lockedByOther ? `${activeLock.userName}` : iHaveLock ? "You" : "No one";
+  const editingLabel =
+    lockedByOther ? `${activeLock.userName}`
+      : iHaveLock ? "You"
+        : editingUserId ? (fileWatchers.find(u => String(u.userId) === String(editingUserId))?.userName || "Someone")
+          : "No one";
 
   return (
       <div className="editor-bg">
@@ -331,7 +354,7 @@ export default function Editor({ user, project: initialProject, onBack }) {
             )}
             <div className="top-divider" />
             <div className="active-users">
-              {activeUsers.map(u => (
+              {fileWatchers.map(u => (
                   <div key={u.userId} className="user-badge" style={{ background: u.color }} title={u.userName}>
                     {u.userName[0].toUpperCase()}
                   </div>
@@ -343,7 +366,7 @@ export default function Editor({ user, project: initialProject, onBack }) {
         {/* Collab bar (explicit lock control) */}
         <div className="collab-bar">
           <div className="collab-left">
-            <span className="collab-pill">Watching: {activeUsers.length}</span>
+            <span className="collab-pill">Watching: {fileWatchers.length}</span>
             <span className="collab-pill">Editing: {editingLabel}</span>
             <span className="collab-pill">
               Realtime: {rtStatus.connected ? "connected" : "offline"}
