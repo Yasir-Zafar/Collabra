@@ -10,8 +10,19 @@ export default function Dashboard({ user, onOpen }) {
     fetch("http://localhost:3001/projects", {
       headers: { "Authorization": `Bearer ${token}` },
     })
-      .then(r => r.json())
-      .then(data => { setProjects(data); setLoading(false); });
+      .then(async (r) => {
+        if (r.status === 401) {
+          localStorage.removeItem("authToken");
+          window.location.reload();
+          return null;
+        }
+        return await r.json();
+      })
+      .then(data => {
+        if (!data) return;
+        setProjects(data);
+        setLoading(false);
+      });
   }, []);
 
   async function createProject() {
@@ -26,6 +37,11 @@ export default function Dashboard({ user, onOpen }) {
       },
       body: JSON.stringify({ name: trimmed }),
     });
+    if (res.status === 401) {
+      localStorage.removeItem("authToken");
+      window.location.reload();
+      return;
+    }
     const project = await res.json();
     setProjects(p => [...p, { id: project.id, name: project.name, ownerName: project.ownerName, fileCount: 1 }]);
     setNewName("");

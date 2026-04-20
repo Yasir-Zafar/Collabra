@@ -17,6 +17,7 @@ export default function Editor({ user, project: initialProject, onBack }) {
   const [toasts, setToasts]             = useState([]);
   const [membersOpen, setMembersOpen]   = useState(false);
   const [acquiring, setAcquiring]       = useState(false);
+  const [rtStatus, setRtStatus]         = useState({ connected: socket.connected, err: "" });
   const toastId    = useRef(0);
   const historyRef = useRef({}); // { [fileId]: { past[], future[] } }
   const joinedRef  = useRef(false);
@@ -33,12 +34,19 @@ export default function Editor({ user, project: initialProject, onBack }) {
     setTimeout(() => setToasts(t => t.filter(x => x.id !== id)), 3500);
   }, []);
 
+  function forceRelogin() {
+    localStorage.removeItem("authToken");
+    // Hard reload to re-enter App's auth gate.
+    window.location.reload();
+  }
+
   // ── Socket ────────────────────────────────────────────────────────────────
   useEffect(() => {
     joinedRef.current = false;
     setProject(null);
     setActiveFileId(null);
     setLoadErr("");
+    setRtStatus({ connected: socket.connected, err: "" });
 
     let cancelled = false;
     async function loadViaRest() {
@@ -47,6 +55,7 @@ export default function Editor({ user, project: initialProject, onBack }) {
         const res = await fetch(`http://localhost:3001/projects/${initialProject.id}`, {
           headers: { "Authorization": `Bearer ${token}` },
         });
+        if (res.status === 401) { forceRelogin(); return; }
         const data = await res.json();
         if (!res.ok) throw new Error(data?.error || "Failed to load project");
         if (cancelled) return;
@@ -74,7 +83,16 @@ export default function Editor({ user, project: initialProject, onBack }) {
     socket.on("user_joined",  ({ userName }) => toast(`${userName} joined`));
     socket.on("user_left",    ({ userId })   => setActiveUsers(u => u.filter(x => x.userId !== userId)));
     socket.on("error_msg",    (msg) => toast(String(msg || "Error")));
-    socket.on("connect_error", (err) => toast(err?.message ? `Socket: ${err.message}` : "Socket error"));
+    socket.on("connect", () => setRtStatus(s => ({ ...s, connected: true, err: "" })));
+    socket.on("disconnect", () => setRtStatus(s => ({ ...s, connected: false })));
+    socket.on("connect_error", (err) => {
+      const msg = err?.message ? String(err.message) : "Socket error";
+      setRtStatus({ connected: false, err: msg });
+      toast(`Socket: ${msg}`);
+      if (msg.toLowerCase().includes("unauthorized")) {
+        forceRelogin();
+      }
+    });
 
     function joinOnce() {
       if (joinedRef.current) return;
@@ -85,6 +103,9 @@ export default function Editor({ user, project: initialProject, onBack }) {
     if (socket.connected) {
       joinOnce();
     } else {
+      // Ensure auth token is present even on hard refresh/navigation.
+      const token = localStorage.getItem("authToken");
+      if (token) socket.auth = { token };
       socket.once("connect", joinOnce);
       socket.connect();
     }
@@ -116,7 +137,7 @@ export default function Editor({ user, project: initialProject, onBack }) {
       const fid = activeFileIdRef.current;
       if (fid) socket.emit("release_lock", { fileId: fid });
       ["init_state","users_update","user_joined","user_left","lock_acquired","lock_released",
-        "lock_denied","shape_added","shape_updated","shape_deleted","snapshot","file_added","error_msg","connect_error"]
+        "lock_denied","shape_added","shape_updated","shape_deleted","snapshot","file_added","error_msg","connect_error","connect","disconnect"]
           .forEach(ev => socket.off(ev));
       socket.off("connect", joinOnce);
       socket.off("connect_error");
@@ -323,6 +344,9 @@ export default function Editor({ user, project: initialProject, onBack }) {
           <div className="collab-left">
             <span className="collab-pill">Watching: {activeUsers.length}</span>
             <span className="collab-pill">Editing: {editingLabel}</span>
+            <span className="collab-pill">
+              Realtime: {rtStatus.connected ? "connected" : "offline"}
+            </span>
           </div>
           <div className="collab-right">
             {viewOnly ? (
