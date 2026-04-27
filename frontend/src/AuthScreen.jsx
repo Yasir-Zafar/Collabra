@@ -1,4 +1,4 @@
-import { useState } from "react";
+import { useEffect, useRef, useState } from "react";
 import { connectSocketWithToken } from "./socket";
 import { API_BASE, withApiHeaders } from "./config";
 
@@ -9,11 +9,32 @@ export default function AuthScreen({ onLogin }) {
   const [password, setPassword] = useState("");
   const [err, setErr] = useState("");
   const [loading, setLoading] = useState(false);
+  const googleButtonRef = useRef(null);
+  const googleConfigured = Boolean(import.meta.env.VITE_GOOGLE_CLIENT_ID);
 
   async function finishAuth(data) {
     localStorage.setItem("authToken", data.token);
     connectSocketWithToken(data.token);
     onLogin(data.user);
+  }
+
+  async function authRequest(path, body) {
+    const headers = withApiHeaders({ "Content-Type": "application/json" });
+    try {
+      return await fetch(`${API_BASE}${path}`, {
+        method: "POST",
+        headers,
+        body: JSON.stringify(body),
+      });
+    } catch (error) {
+      // Common local-dev case: stale ngrok URL in VITE_API_BASE while API runs on localhost.
+      if (!API_BASE.includes("ngrok")) throw error;
+      return fetch(`http://localhost:3001${path}`, {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify(body),
+      });
+    }
   }
 
   async function handleSubmit() {
@@ -38,11 +59,7 @@ export default function AuthScreen({ onLogin }) {
         ? { email, password }
         : { email, displayName, password };
 
-      const res = await fetch(`${API_BASE}${url}`, {
-        method: "POST",
-        headers: withApiHeaders({ "Content-Type": "application/json" }),
-        body: JSON.stringify(body),
-      });
+      const res = await authRequest(url, body);
 
       const data = await res.json();
       if (!res.ok) {
@@ -58,6 +75,64 @@ export default function AuthScreen({ onLogin }) {
       setLoading(false);
     }
   }
+
+  useEffect(() => {
+    if (!googleConfigured) return undefined;
+    const scriptId = "google-identity-script";
+    let mounted = true;
+
+    async function handleGoogleCredential(credential) {
+      setErr("");
+      setLoading(true);
+      try {
+        const res = await authRequest("/auth/google", { credential });
+        const data = await res.json();
+        if (!res.ok) {
+          setErr(data.error || "Google Sign-in failed");
+          setLoading(false);
+          return;
+        }
+        await finishAuth(data);
+      } catch (e) {
+        setErr("Google Sign-in failed: " + e.message);
+        setLoading(false);
+      }
+    }
+
+    function renderGoogleButton() {
+      if (!mounted || !googleButtonRef.current || !window.google?.accounts?.id) return;
+      googleButtonRef.current.innerHTML = "";
+      window.google.accounts.id.initialize({
+        client_id: import.meta.env.VITE_GOOGLE_CLIENT_ID,
+        callback: (response) => handleGoogleCredential(response.credential),
+      });
+      window.google.accounts.id.renderButton(googleButtonRef.current, {
+        type: "standard",
+        shape: "pill",
+        theme: "outline",
+        text: mode === "login" ? "signin_with" : "signup_with",
+        size: "large",
+        width: 280,
+      });
+    }
+
+    if (!document.getElementById(scriptId)) {
+      const script = document.createElement("script");
+      script.id = scriptId;
+      script.src = "https://accounts.google.com/gsi/client";
+      script.async = true;
+      script.defer = true;
+      script.onload = renderGoogleButton;
+      script.onerror = () => setErr("Failed to load Google Sign-in");
+      document.head.appendChild(script);
+    } else {
+      renderGoogleButton();
+    }
+
+    return () => {
+      mounted = false;
+    };
+  }, [googleConfigured, mode]);
 
   return (
     <div className="auth-bg">
@@ -119,6 +194,15 @@ export default function AuthScreen({ onLogin }) {
         <button className="btn-primary" onClick={handleSubmit} disabled={loading}>
           {loading ? "Loading..." : (mode === "login" ? "Login" : "Sign Up")}
         </button>
+
+        <div className="auth-divider">or</div>
+        {!googleConfigured ? (
+          <p className="muted">Google Sign-in is not configured.</p>
+        ) : (
+          <div className={`google-wrap ${loading ? "disabled" : ""}`}>
+            <div ref={googleButtonRef} />
+          </div>
+        )}
       </div>
     </div>
   );

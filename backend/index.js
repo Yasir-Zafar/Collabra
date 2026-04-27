@@ -9,11 +9,13 @@ const { Server } = require("socket.io");
 const cors = require("cors");
 const { v4: uuidv4 } = require("uuid");
 const crypto = require("crypto");
+const { OAuth2Client } = require("google-auth-library");
 const sql = require("./db.js");
 
 const app = express();
 app.use(cors());
 app.use(express.json());
+const googleClient = new OAuth2Client(process.env.GOOGLE_CLIENT_ID);
 
 const server = http.createServer(app);
 const io = new Server(server, {
@@ -43,6 +45,64 @@ let colorIdx = 0;
 function colorFor(userId) {
   if (!assignedColors[userId]) assignedColors[userId] = COLORS[colorIdx++ % COLORS.length];
   return assignedColors[userId];
+}
+
+const TEMPLATE_CATALOG = [
+  {
+    id: "blank",
+    name: "Blank",
+    description: "Start with an empty canvas.",
+    files: [
+      { name: "Page 1", shapes: [] },
+    ],
+  },
+  {
+    id: "poster-starter",
+    name: "Poster Starter",
+    description: "Title, subtitle, and accent blocks for quick poster drafts.",
+    files: [
+      {
+        name: "Poster",
+        shapes: [
+          { id: "tpl-bg-1", type: "rect", x: 0, y: 0, w: 900, h: 600, fill: "#f8fafc", stroke: "#e2e8f0", sw: 1 },
+          { id: "tpl-title-1", type: "text", x: 80, y: 130, text: "Your Event Title", fontSize: 48, fill: "#0f172a" },
+          { id: "tpl-sub-1", type: "text", x: 80, y: 180, text: "Subtitle or date goes here", fontSize: 24, fill: "#475569" },
+          { id: "tpl-accent-1", type: "rect", x: 80, y: 230, w: 320, h: 10, fill: "#6366f1", stroke: "#6366f1", sw: 1 },
+          { id: "tpl-note-1", type: "text", x: 80, y: 540, text: "Edit text and colors to customize", fontSize: 18, fill: "#64748b" },
+        ],
+      },
+    ],
+  },
+  {
+    id: "social-pack",
+    name: "Social Media Pack",
+    description: "Two pages: post and story layout.",
+    files: [
+      {
+        name: "Post",
+        shapes: [
+          { id: "tpl-post-bg", type: "rect", x: 0, y: 0, w: 900, h: 600, fill: "#111827", stroke: "#111827", sw: 1 },
+          { id: "tpl-post-title", type: "text", x: 70, y: 110, text: "Launch Update", fontSize: 54, fill: "#f8fafc" },
+          { id: "tpl-post-sub", type: "text", x: 70, y: 160, text: "Share your product highlight", fontSize: 24, fill: "#cbd5e1" },
+          { id: "tpl-post-chip", type: "rect", x: 70, y: 200, w: 180, h: 42, fill: "#6366f1", stroke: "#6366f1", sw: 1 },
+          { id: "tpl-post-chip-text", type: "text", x: 88, y: 228, text: "Call to Action", fontSize: 19, fill: "#ffffff" },
+        ],
+      },
+      {
+        name: "Story",
+        shapes: [
+          { id: "tpl-story-bg", type: "rect", x: 0, y: 0, w: 900, h: 600, fill: "#1e1b4b", stroke: "#1e1b4b", sw: 1 },
+          { id: "tpl-story-card", type: "rect", x: 170, y: 80, w: 560, h: 430, fill: "#ffffff", stroke: "#e2e8f0", sw: 2 },
+          { id: "tpl-story-title", type: "text", x: 220, y: 170, text: "Story Headline", fontSize: 42, fill: "#0f172a" },
+          { id: "tpl-story-sub", type: "text", x: 220, y: 220, text: "Quick summary text block", fontSize: 22, fill: "#475569" },
+        ],
+      },
+    ],
+  },
+];
+
+function getTemplateById(templateId) {
+  return TEMPLATE_CATALOG.find(t => t.id === templateId) || TEMPLATE_CATALOG[0];
 }
 
 // ── Per-file presence (watchers) ────────────────────────────────────────────
@@ -255,9 +315,80 @@ app.post("/auth/login", async (req, res) => {
   }
 });
 
+app.post("/auth/google", async (req, res) => {
+  const { credential } = req.body || {};
+  if (!credential) {
+    return res.status(400).json({ error: "Missing Google credential" });
+  }
+  if (!process.env.GOOGLE_CLIENT_ID) {
+    return res.status(500).json({ error: "Google Sign-in is not configured" });
+  }
+
+  try {
+    const ticket = await googleClient.verifyIdToken({
+      idToken: credential,
+      audience: process.env.GOOGLE_CLIENT_ID,
+    });
+    const payload = ticket.getPayload();
+    const email = payload?.email?.trim().toLowerCase();
+    if (!email) return res.status(400).json({ error: "Google account email missing" });
+
+    const fallbackName = (payload?.name || email.split("@")[0] || "Google User").trim();
+    const displayName = fallbackName.slice(0, 80);
+
+    let user = await sql`
+      SELECT id, email, display_name
+      FROM users
+      WHERE email = ${email}
+      LIMIT 1
+    `;
+
+    if (!user.length) {
+      const generatedPasswordHash = hashPassword(uuidv4());
+      user = await sql`
+        INSERT INTO users (email, display_name, password)
+        VALUES (${email}, ${displayName}, ${generatedPasswordHash})
+        RETURNING id, email, display_name
+      `;
+    }
+
+    const token = uuidv4();
+    const authedUser = user[0];
+    tokens[token] = {
+      userId: idToString(authedUser.id),
+      email: authedUser.email,
+      displayName: authedUser.display_name,
+      createdAt: Date.now(),
+    };
+
+    res.json({
+      token,
+      user: {
+        userId: idToString(authedUser.id),
+        userName: authedUser.display_name,
+        email: authedUser.email,
+      },
+    });
+  } catch (err) {
+    console.error("Google auth error:", err);
+    res.status(401).json({ error: "Google authentication failed" });
+  }
+});
+
 // Verify token route
 app.post("/auth/verify", verifyToken, (req, res) => {
   res.json({ user: { userId: idToString(req.user.userId), userName: req.user.displayName, email: req.user.email } });
+});
+
+app.get("/templates", verifyToken, async (_req, res) => {
+  res.json(
+    TEMPLATE_CATALOG.map(t => ({
+      id: t.id,
+      name: t.name,
+      description: t.description,
+      fileCount: t.files.length,
+    }))
+  );
 });
 
 // Project endpoints
@@ -295,7 +426,7 @@ app.get("/projects", verifyToken, async (req, res) => {
 });
 
 app.post("/projects", verifyToken, async (req, res) => {
-  const { name } = req.body;
+  const { name, templateId } = req.body;
   const ownerId = req.user.userId;
   if (!name || !String(name).trim()) return res.status(400).json({ error: "Missing name" });
 
@@ -310,19 +441,36 @@ app.post("/projects", verifyToken, async (req, res) => {
       VALUES (${project[0].id}, ${ownerId}, 'editor')
       ON CONFLICT (project_id, user_id) DO NOTHING
     `;
-    const file = await sql`
-      INSERT INTO project_files (project_id, name, shapes)
-      VALUES (${project[0].id}, 'Page 1', '[]'::jsonb)
-      RETURNING id, name
-    `;
+    const template = getTemplateById(String(templateId || "blank"));
+    const insertedFiles = [];
+    for (const fileDef of template.files) {
+      const file = await sql`
+        INSERT INTO project_files (project_id, name, shapes)
+        VALUES (
+          ${project[0].id},
+          ${String(fileDef.name || "Page").trim()},
+          ${JSON.stringify(Array.isArray(fileDef.shapes) ? fileDef.shapes : [])}::jsonb
+        )
+        RETURNING id, name, shapes
+      `;
+      insertedFiles.push(file[0]);
+    }
     const owner = await sql`SELECT display_name FROM users WHERE id = ${ownerId} LIMIT 1`;
+    const files = {};
+    for (const f of insertedFiles) {
+      files[f.id] = {
+        id: f.id,
+        name: f.name,
+        shapes: Array.isArray(f.shapes) ? f.shapes : [],
+      };
+    }
     res.json({
       id: project[0].id,
       name: project[0].name,
       ownerId: idToString(project[0].owner_id),
       isOwner: true,
       ownerName: owner[0]?.display_name ?? req.user.displayName,
-      files: { [file[0].id]: { id: file[0].id, name: file[0].name, shapes: [] } },
+      files,
       myRole: "editor",
     });
   } catch (err) {

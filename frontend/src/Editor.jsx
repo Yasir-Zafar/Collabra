@@ -272,6 +272,34 @@ export default function Editor({ user, project: initialProject, onBack }) {
     URL.revokeObjectURL(url);
   }
 
+  function exportProjectPackage() {
+    if (!project?.files) return;
+    (async () => {
+      try {
+        const { default: JSZip } = await import("jszip");
+        const zip = new JSZip();
+        const files = Object.values(project.files);
+        files.forEach((file, idx) => {
+          const shapes = Array.isArray(file.shapes) ? file.shapes : [];
+          const svg = buildSvgFromShapes(shapes);
+          const safePageName = String(file.name || `Page ${idx + 1}`).replace(/[^\w.-]+/g, "_");
+          zip.file(`${String(idx + 1).padStart(2, "0")}_${safePageName}.svg`, svg);
+        });
+
+        const zipBlob = await zip.generateAsync({ type: "blob" });
+        const url = URL.createObjectURL(zipBlob);
+        const a = document.createElement("a");
+        const safeProjectName = String(project.name || "project").replace(/[^\w.-]+/g, "_");
+        a.href = url;
+        a.download = `${safeProjectName}_images.zip`;
+        a.click();
+        URL.revokeObjectURL(url);
+      } catch {
+        toast("Install frontend dependency: npm i jszip");
+      }
+    })();
+  }
+
   function handleImageUpload(e) {
     const file = e.target.files[0];
     if (!file || !tryAcquireLock()) return;
@@ -346,6 +374,7 @@ export default function Editor({ user, project: initialProject, onBack }) {
               Members
             </button>
             <button className="topbar-btn" onClick={exportCanvas}>Export SVG</button>
+            <button className="topbar-btn" onClick={exportProjectPackage}>Export Project</button>
             {!viewOnly && (
               <label className="topbar-btn" style={{ cursor:"pointer" }}>
                 Add Image
@@ -518,4 +547,56 @@ function deleteShape(p, fileId, shapeId) {
 function setShapes(p, fileId, shapes) {
   if (!p.files[fileId]) return p;
   return { ...p, files: { ...p.files, [fileId]: { ...p.files[fileId], shapes } } };
+}
+
+function esc(value) {
+  return String(value)
+    .replaceAll("&", "&amp;")
+    .replaceAll("<", "&lt;")
+    .replaceAll(">", "&gt;")
+    .replaceAll('"', "&quot;");
+}
+
+function buildSvgFromShapes(shapes, width = 900, height = 600) {
+  const body = (Array.isArray(shapes) ? shapes : [])
+    .map(shapeToSvg)
+    .filter(Boolean)
+    .join("");
+  return `<svg xmlns="http://www.w3.org/2000/svg" width="${width}" height="${height}" viewBox="0 0 ${width} ${height}"><rect width="100%" height="100%" fill="white" />${body}</svg>`;
+}
+
+function shapeToSvg(s) {
+  if (!s || !s.type) return "";
+  if (s.type === "rect") {
+    return `<rect x="${Number(s.x) || 0}" y="${Number(s.y) || 0}" width="${Math.max(0, Number(s.w) || 0)}" height="${Math.max(0, Number(s.h) || 0)}" rx="4" fill="${esc(s.fill || "#ffffff")}" stroke="${esc(s.stroke || "#000000")}" stroke-width="${Number(s.sw) || 1}" />`;
+  }
+  if (s.type === "diamond") {
+    const x = Number(s.x) || 0;
+    const y = Number(s.y) || 0;
+    const w = Math.max(0, Number(s.w) || 0);
+    const h = Math.max(0, Number(s.h) || 0);
+    const cx = x + w / 2;
+    const cy = y + h / 2;
+    return `<polygon points="${cx},${y} ${x + w},${cy} ${cx},${y + h} ${x},${cy}" fill="${esc(s.fill || "#ffffff")}" stroke="${esc(s.stroke || "#000000")}" stroke-width="${Number(s.sw) || 1}" />`;
+  }
+  if (s.type === "ellipse") {
+    return `<ellipse cx="${Number(s.cx) || 0}" cy="${Number(s.cy) || 0}" rx="${Math.max(0, Number(s.rx) || 0)}" ry="${Math.max(0, Number(s.ry) || 0)}" fill="${esc(s.fill || "#ffffff")}" stroke="${esc(s.stroke || "#000000")}" stroke-width="${Number(s.sw) || 1}" />`;
+  }
+  if (s.type === "line") {
+    return `<line x1="${Number(s.x1) || 0}" y1="${Number(s.y1) || 0}" x2="${Number(s.x2) || 0}" y2="${Number(s.y2) || 0}" stroke="${esc(s.stroke || "#000000")}" stroke-width="${Number(s.sw) || 1}" stroke-linecap="round" />`;
+  }
+  if (s.type === "brush") {
+    const points = Array.isArray(s.points)
+      ? s.points.map(p => `${Number(p?.x) || 0},${Number(p?.y) || 0}`).join(" ")
+      : "";
+    if (!points) return "";
+    return `<polyline points="${points}" fill="none" stroke="${esc(s.stroke || "#000000")}" stroke-width="${Number(s.sw) || 3}" stroke-linecap="round" stroke-linejoin="round" />`;
+  }
+  if (s.type === "text") {
+    return `<text x="${Number(s.x) || 0}" y="${Number(s.y) || 0}" font-size="${Number(s.fontSize) || 20}" fill="${esc(s.fill || "#000000")}" font-family="system-ui,sans-serif">${esc(s.text || "")}</text>`;
+  }
+  if (s.type === "image") {
+    return `<image href="${esc(s.href || "")}" x="${Number(s.x) || 0}" y="${Number(s.y) || 0}" width="${Math.max(0, Number(s.w) || 0)}" height="${Math.max(0, Number(s.h) || 0)}" />`;
+  }
+  return "";
 }

@@ -163,7 +163,7 @@ body {
 .dash-main { padding: 32px 36px; }
 .dash-top { display: flex; align-items: center; justify-content: space-between; margin-bottom: 28px; }
 .dash-title { font-size: 22px; font-weight: 800; }
-.new-project-row { display: flex; gap: 10px; width: 320px; }
+.new-project-row { display: flex; gap: 10px; width: 560px; }
 .project-grid { display: grid; grid-template-columns: repeat(auto-fill, minmax(220px, 1fr)); gap: 18px; }
 .project-card {
   background: #1e293b; border-radius: 14px; overflow: hidden; cursor: pointer;
