@@ -121,6 +121,27 @@ export default function Dashboard({ user, onOpen }) {
     setProjects(p => p.filter(x => String(x.id) !== String(projectId)));
   }
 
+  async function renameProject(projectId, currentName) {
+    const nextName = window.prompt("Rename project", currentName)?.trim();
+    if (!nextName || nextName === currentName) return;
+    const token = localStorage.getItem("authToken");
+    const res = await fetch(`${API_BASE}/projects/${projectId}`, {
+      method: "PATCH",
+      headers: withApiHeaders({
+        "Content-Type": "application/json",
+        "Authorization": `Bearer ${token}`,
+      }),
+      body: JSON.stringify({ name: nextName }),
+    });
+    if (res.status === 401) {
+      localStorage.removeItem("authToken");
+      window.location.reload();
+      return;
+    }
+    if (!res.ok) return;
+    setProjects(p => p.map(x => (String(x.id) === String(projectId) ? { ...x, name: nextName } : x)));
+  }
+
   function handleLogout() {
     localStorage.removeItem("authToken");
     window.location.reload();
@@ -189,12 +210,21 @@ export default function Dashboard({ user, onOpen }) {
                   <div className="project-name-row">
                     <div className="project-name">{p.name}</div>
                     {p.isOwner && (
-                      <button
-                        className="btn-danger btn-danger-sm"
-                        onClick={(e) => { e.stopPropagation(); deleteProject(p.id); }}
-                      >
-                        Delete
-                      </button>
+                      <div style={{ display: "flex", gap: "6px" }}>
+                        <button
+                          className="btn-ghost"
+                          style={{ padding: "4px 8px", fontSize: "11px" }}
+                          onClick={(e) => { e.stopPropagation(); renameProject(p.id, p.name); }}
+                        >
+                          Rename
+                        </button>
+                        <button
+                          className="btn-danger btn-danger-sm"
+                          onClick={(e) => { e.stopPropagation(); deleteProject(p.id); }}
+                        >
+                          Delete
+                        </button>
+                      </div>
                     )}
                   </div>
                   <div className="project-meta">{p.fileCount} page{p.fileCount !== 1 ? "s" : ""} · by {p.ownerName}</div>

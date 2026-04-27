@@ -1,25 +1,15 @@
-import { useRef, useState, useEffect } from "react";
+import { useRef, useState } from "react";
 import { v4 as uuidv4 } from "uuid";
+
+const CANVAS_WIDTH = 1600;
+const CANVAS_HEIGHT = 1000;
 
 export default function Canvas({ shapes, tool, myColor, locked, onShapeAdd, onShapeUpdate, onShapeMoveStart, onShapeDelete }) {
   const safeShapes = Array.isArray(shapes) ? shapes : [];
   const svgRef  = useRef(null);
-  const wrapRef = useRef(null);
-  const [size, setSize]     = useState({ w: 900, h: 600 });
   const [selected, setSelected] = useState(null);
   const [dragging, setDragging] = useState(null); // { shapeId, ox, oy }
   const [drawing,  setDrawing]  = useState(null); // { shape, startX, startY }
-
-  // Resize canvas to fill wrapper
-  useEffect(() => {
-    if (!wrapRef.current) return;
-    const ro = new ResizeObserver(entries => {
-      const { width, height } = entries[0].contentRect;
-      setSize({ w: Math.max(600, width - 48), h: Math.max(400, height - 48) });
-    });
-    ro.observe(wrapRef.current);
-    return () => ro.disconnect();
-  }, []);
 
   function getPos(e) {
     const r = svgRef.current.getBoundingClientRect();
@@ -209,13 +199,13 @@ export default function Canvas({ shapes, tool, myColor, locked, onShapeAdd, onSh
   }
 
   return (
-      <div ref={wrapRef} style={{ flex:1, overflow:"auto", background:"#0f172a", padding:"24px", display:"flex", alignItems:"flex-start", justifyContent:"flex-start" }}>
+      <div className="canvas-wrap">
         <svg
             ref={svgRef}
             className="canvas-svg"
-            width={size.w}
-            height={size.h}
-            viewBox={`0 0 ${size.w} ${size.h}`}
+            width={CANVAS_WIDTH}
+            height={CANVAS_HEIGHT}
+            viewBox={`0 0 ${CANVAS_WIDTH} ${CANVAS_HEIGHT}`}
             style={{ cursor: locked ? "not-allowed" : tool === "select" ? "default" : "crosshair" }}
             onMouseDown={onMouseDown}
             onMouseMove={onMouseMove}

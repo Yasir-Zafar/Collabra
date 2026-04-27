@@ -258,8 +258,13 @@ body {
 .tool-btn:hover { background: #334155; color: #cbd5e1; }
 .tool-btn.active { background: #6366f1; color: #fff; }
 .canvas-wrap {
-  flex: 1; overflow: auto; background: #0f172a;
-  display: flex; align-items: flex-start; justify-content: flex-start; padding: 24px;
+  flex: 1;
+  overflow: auto;
+  background: #0f172a;
+  display: flex;
+  align-items: flex-start;
+  justify-content: flex-start;
+  padding: clamp(12px, 2.5vw, 28px);
 }
 .canvas-svg {
   background: #ffffff; border-radius: 10px; flex-shrink: 0;

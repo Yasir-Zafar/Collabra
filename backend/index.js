@@ -492,6 +492,30 @@ app.get("/projects/:projectId", verifyToken, async (req, res) => {
   }
 });
 
+app.patch("/projects/:projectId", verifyToken, async (req, res) => {
+  const projectId = req.params.projectId;
+  const userId = req.user.userId;
+  const name = String(req.body?.name || "").trim();
+  if (!name) return res.status(400).json({ error: "Missing name" });
+
+  try {
+    const p = await sql`SELECT owner_id FROM projects WHERE id = ${projectId} LIMIT 1`;
+    if (!p.length) return res.status(404).json({ error: "Project not found" });
+    if (String(p[0].owner_id) !== String(userId)) return res.status(403).json({ error: "Owner only" });
+
+    const updated = await sql`
+      UPDATE projects
+      SET name = ${name}
+      WHERE id = ${projectId}
+      RETURNING id, name
+    `;
+    res.json({ id: updated[0].id, name: updated[0].name });
+  } catch (err) {
+    console.error("Rename project error:", err);
+    res.status(500).json({ error: "Failed to rename project" });
+  }
+});
+
 // Members: list members (owner + collaborators)
 app.get("/projects/:projectId/members", verifyToken, async (req, res) => {
   const projectId = req.params.projectId;

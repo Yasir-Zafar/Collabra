@@ -300,6 +300,33 @@ export default function Editor({ user, project: initialProject, onBack }) {
     })();
   }
 
+  async function renameProject() {
+    if (!isOwner) return;
+    const nextName = window.prompt("Rename project", project.name)?.trim();
+    if (!nextName || nextName === project.name) return;
+    try {
+      const token = localStorage.getItem("authToken");
+      const res = await fetch(`${API_BASE}/projects/${project.id}`, {
+        method: "PATCH",
+        headers: withApiHeaders({
+          "Content-Type": "application/json",
+          "Authorization": `Bearer ${token}`,
+        }),
+        body: JSON.stringify({ name: nextName }),
+      });
+      if (res.status === 401) { forceRelogin(); return; }
+      const data = await res.json();
+      if (!res.ok) {
+        toast(data?.error || "Rename failed");
+        return;
+      }
+      setProject(p => ({ ...p, name: data.name }));
+      toast("Project renamed");
+    } catch (err) {
+      toast(`Rename failed: ${err.message}`);
+    }
+  }
+
   function handleImageUpload(e) {
     const file = e.target.files[0];
     if (!file || !tryAcquireLock()) return;
@@ -352,6 +379,7 @@ export default function Editor({ user, project: initialProject, onBack }) {
           <div className="top-left">
             <button className="btn-ghost" onClick={onBack}>← Back</button>
             <span className="project-title">{project.name}</span>
+            {isOwner && <button className="topbar-btn" onClick={renameProject}>Rename</button>}
           </div>
 
           <div className="file-tabs">
