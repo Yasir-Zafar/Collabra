@@ -10,6 +10,7 @@ const cors = require("cors");
 const { v4: uuidv4 } = require("uuid");
 const crypto = require("crypto");
 const { OAuth2Client } = require("google-auth-library");
+const { google } = require("googleapis");
 const sql = require("./db.js");
 
 const app = express();
@@ -38,6 +39,19 @@ const locks = {};     // fileId  -> { userId, userName, color, socketId }
 const tokens = {};    // token -> { userId, email, displayName, createdAt }
 const saveTimers = {}; // fileId -> Timeout (debounced DB snapshot writes)
 const fileStates = {}; // fileId -> shapes[] (in-memory working set for debounce)
+const fileProjectMap = {}; // fileId -> projectId
+const driveOauthStates = {}; // oauth state -> { userId, projectId, expiresAt }
+const driveSyncTimers = {}; // projectId -> timeout
+const driveSyncRunning = {}; // projectId -> boolean
+
+const DRIVE_SCOPES = [
+  "https://www.googleapis.com/auth/drive.file",
+  "https://www.googleapis.com/auth/userinfo.email",
+  "openid",
+];
+const DRIVE_CLIENT_ID = process.env.GOOGLE_DRIVE_CLIENT_ID || "";
+const DRIVE_CLIENT_SECRET = process.env.GOOGLE_DRIVE_CLIENT_SECRET || "";
+const DRIVE_REDIRECT_URI = process.env.GOOGLE_DRIVE_REDIRECT_URI || "";
 
 const COLORS = ["#6366f1","#f59e0b","#10b981","#ef4444","#3b82f6","#ec4899","#14b8a6","#f97316"];
 const assignedColors = {};
@@ -45,6 +59,109 @@ let colorIdx = 0;
 function colorFor(userId) {
   if (!assignedColors[userId]) assignedColors[userId] = COLORS[colorIdx++ % COLORS.length];
   return assignedColors[userId];
+}
+
+function sanitizeFileName(value, fallback = "untitled") {
+  const base = String(value || "").trim().replace(/[\\/:*?"<>|]+/g, "_");
+  return base || fallback;
+}
+
+function escSvg(value) {
+  return String(value)
+    .replaceAll("&", "&amp;")
+    .replaceAll("<", "&lt;")
+    .replaceAll(">", "&gt;")
+    .replaceAll('"', "&quot;");
+}
+
+function shapeToSvg(s) {
+  if (!s || !s.type) return "";
+  if (s.type === "rect") {
+    return `<rect x="${Number(s.x) || 0}" y="${Number(s.y) || 0}" width="${Math.max(0, Number(s.w) || 0)}" height="${Math.max(0, Number(s.h) || 0)}" rx="4" fill="${escSvg(s.fill || "#ffffff")}" stroke="${escSvg(s.stroke || "#000000")}" stroke-width="${Number(s.sw) || 1}" />`;
+  }
+  if (s.type === "diamond") {
+    const x = Number(s.x) || 0;
+    const y = Number(s.y) || 0;
+    const w = Math.max(0, Number(s.w) || 0);
+    const h = Math.max(0, Number(s.h) || 0);
+    const cx = x + w / 2;
+    const cy = y + h / 2;
+    return `<polygon points="${cx},${y} ${x + w},${cy} ${cx},${y + h} ${x},${cy}" fill="${escSvg(s.fill || "#ffffff")}" stroke="${escSvg(s.stroke || "#000000")}" stroke-width="${Number(s.sw) || 1}" />`;
+  }
+  if (s.type === "ellipse") {
+    return `<ellipse cx="${Number(s.cx) || 0}" cy="${Number(s.cy) || 0}" rx="${Math.max(0, Number(s.rx) || 0)}" ry="${Math.max(0, Number(s.ry) || 0)}" fill="${escSvg(s.fill || "#ffffff")}" stroke="${escSvg(s.stroke || "#000000")}" stroke-width="${Number(s.sw) || 1}" />`;
+  }
+  if (s.type === "line") {
+    return `<line x1="${Number(s.x1) || 0}" y1="${Number(s.y1) || 0}" x2="${Number(s.x2) || 0}" y2="${Number(s.y2) || 0}" stroke="${escSvg(s.stroke || "#000000")}" stroke-width="${Number(s.sw) || 1}" stroke-linecap="round" />`;
+  }
+  if (s.type === "brush") {
+    const points = Array.isArray(s.points)
+      ? s.points.map((p) => `${Number(p?.x) || 0},${Number(p?.y) || 0}`).join(" ")
+      : "";
+    if (!points) return "";
+    return `<polyline points="${points}" fill="none" stroke="${escSvg(s.stroke || "#000000")}" stroke-width="${Number(s.sw) || 3}" stroke-linecap="round" stroke-linejoin="round" />`;
+  }
+  if (s.type === "text") {
+    return `<text x="${Number(s.x) || 0}" y="${Number(s.y) || 0}" font-size="${Number(s.fontSize) || 20}" fill="${escSvg(s.fill || "#000000")}" font-family="system-ui,sans-serif">${escSvg(s.text || "")}</text>`;
+  }
+  if (s.type === "image") {
+    return `<image href="${escSvg(s.href || "")}" x="${Number(s.x) || 0}" y="${Number(s.y) || 0}" width="${Math.max(0, Number(s.w) || 0)}" height="${Math.max(0, Number(s.h) || 0)}" />`;
+  }
+  return "";
+}
+
+function buildSvgFromShapes(shapes, width = 900, height = 600) {
+  const body = (Array.isArray(shapes) ? shapes : [])
+    .map(shapeToSvg)
+    .filter(Boolean)
+    .join("");
+  return `<svg xmlns="http://www.w3.org/2000/svg" width="${width}" height="${height}" viewBox="0 0 ${width} ${height}"><rect width="100%" height="100%" fill="white" />${body}</svg>`;
+}
+
+function isDriveConfigured() {
+  return Boolean(DRIVE_CLIENT_ID && DRIVE_CLIENT_SECRET && DRIVE_REDIRECT_URI);
+}
+
+function createDriveOAuthClient() {
+  return new google.auth.OAuth2(DRIVE_CLIENT_ID, DRIVE_CLIENT_SECRET, DRIVE_REDIRECT_URI);
+}
+
+async function ensureDriveIntegrationSchema() {
+  await sql`
+    CREATE TABLE IF NOT EXISTS drive_project_links (
+      id BIGSERIAL PRIMARY KEY,
+      project_id TEXT NOT NULL,
+      user_id TEXT NOT NULL,
+      google_email TEXT NOT NULL,
+      access_token TEXT,
+      refresh_token TEXT,
+      scope TEXT,
+      expiry_date BIGINT,
+      drive_folder_id TEXT,
+      drive_file_id TEXT,
+      last_synced_at TIMESTAMPTZ,
+      last_error TEXT,
+      created_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+      updated_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+      UNIQUE(project_id, user_id)
+    )
+  `;
+
+  const columnTypes = await sql`
+    SELECT column_name, data_type
+    FROM information_schema.columns
+    WHERE table_name = 'drive_project_links'
+      AND column_name IN ('project_id', 'user_id')
+  `;
+  const typeByColumn = {};
+  for (const row of columnTypes) typeByColumn[row.column_name] = row.data_type;
+
+  if (typeByColumn.project_id && typeByColumn.project_id !== "text") {
+    await sql`ALTER TABLE drive_project_links ALTER COLUMN project_id TYPE TEXT USING project_id::text`;
+  }
+  if (typeByColumn.user_id && typeByColumn.user_id !== "text") {
+    await sql`ALTER TABLE drive_project_links ALTER COLUMN user_id TYPE TEXT USING user_id::text`;
+  }
 }
 
 const TEMPLATE_CATALOG = [
@@ -179,6 +296,7 @@ async function loadProjectForUser({ projectId, userId }) {
 
   const filesMap = {};
   for (const f of files) {
+    fileProjectMap[f.id] = projectId;
     let shapes = [];
     if (Array.isArray(f.shapes)) {
       shapes = f.shapes;
@@ -210,6 +328,216 @@ async function loadProjectForUser({ projectId, userId }) {
   };
 }
 
+async function getProjectIdForFile(fileId) {
+  if (fileProjectMap[fileId]) return fileProjectMap[fileId];
+  const rows = await sql`
+    SELECT project_id
+    FROM project_files
+    WHERE id = ${fileId}
+    LIMIT 1
+  `;
+  if (!rows.length) return null;
+  fileProjectMap[fileId] = rows[0].project_id;
+  return rows[0].project_id;
+}
+
+async function loadProjectSnapshot(projectId) {
+  const rows = await sql`
+    SELECT p.id, p.name, p.owner_id, u.display_name AS owner_name
+    FROM projects p
+    JOIN users u ON u.id = p.owner_id
+    WHERE p.id = ${projectId}
+    LIMIT 1
+  `;
+  if (!rows.length) return null;
+
+  const files = await sql`
+    SELECT id, name, shapes
+    FROM project_files
+    WHERE project_id = ${projectId}
+    ORDER BY created_at ASC
+  `;
+
+  function normalizeShapes(rawShapes) {
+    if (Array.isArray(rawShapes)) return rawShapes;
+    if (typeof rawShapes === "string") {
+      try {
+        const parsed = JSON.parse(rawShapes);
+        return Array.isArray(parsed) ? parsed : [];
+      } catch {
+        return [];
+      }
+    }
+    if (rawShapes && typeof rawShapes === "object") {
+      return Array.isArray(rawShapes) ? rawShapes : [];
+    }
+    return [];
+  }
+
+  return {
+    id: rows[0].id,
+    name: rows[0].name,
+    ownerId: idToString(rows[0].owner_id),
+    ownerName: rows[0].owner_name,
+    files: files.map((f) => ({
+      id: idToString(f.id),
+      name: f.name,
+      shapes: normalizeShapes(f.shapes),
+    })),
+  };
+}
+
+async function getDriveLinksForProject(projectId) {
+  return sql`
+    SELECT *
+    FROM drive_project_links
+    WHERE project_id = ${projectId}
+  `;
+}
+
+async function persistDriveLinkStatus(linkId, { error = null, synced = false }) {
+  await sql`
+    UPDATE drive_project_links
+    SET
+      updated_at = NOW(),
+      last_error = ${error},
+      last_synced_at = CASE WHEN ${synced} THEN NOW() ELSE last_synced_at END
+    WHERE id = ${linkId}
+  `;
+}
+
+async function persistDriveCredentials(linkId, credentials) {
+  if (!credentials) return;
+  await sql`
+    UPDATE drive_project_links
+    SET
+      access_token = COALESCE(${credentials.access_token || null}, access_token),
+      refresh_token = COALESCE(${credentials.refresh_token || null}, refresh_token),
+      scope = COALESCE(${credentials.scope || null}, scope),
+      expiry_date = COALESCE(${credentials.expiry_date || null}, expiry_date),
+      updated_at = NOW()
+    WHERE id = ${linkId}
+  `;
+}
+
+async function ensureDriveMirrorForLink(link, snapshot) {
+  const oauth = createDriveOAuthClient();
+  oauth.setCredentials({
+    access_token: link.access_token,
+    refresh_token: link.refresh_token,
+    expiry_date: link.expiry_date ? Number(link.expiry_date) : undefined,
+    scope: link.scope || undefined,
+  });
+  const drive = google.drive({ version: "v3", auth: oauth });
+  const folderName = String(snapshot.name || "Collabra Project");
+  let folderId = link.drive_folder_id || null;
+
+  if (!folderId) {
+    const createdFolder = await drive.files.create({
+      requestBody: {
+        name: folderName,
+        mimeType: "application/vnd.google-apps.folder",
+      },
+      fields: "id",
+    });
+    folderId = createdFolder.data.id;
+  } else {
+    await drive.files.update({
+      fileId: folderId,
+      requestBody: { name: folderName },
+    });
+  }
+
+  // Keep Drive mirror one-way and exact: clear old page exports, then re-upload current pages.
+  const existing = await drive.files.list({
+    q: `'${folderId}' in parents and trashed = false`,
+    fields: "files(id,mimeType)",
+    pageSize: 1000,
+  });
+  for (const file of existing.data.files || []) {
+    if (file.mimeType === "application/vnd.google-apps.folder") continue;
+    await drive.files.delete({ fileId: file.id });
+  }
+
+  const safeProjectName = sanitizeFileName(snapshot.name, "Project");
+  const files = Array.isArray(snapshot.files) ? snapshot.files : [];
+  for (let i = 0; i < files.length; i += 1) {
+    const page = files[i];
+    const safePageName = sanitizeFileName(page?.name, `Page_${i + 1}`);
+    const svg = buildSvgFromShapes(Array.isArray(page?.shapes) ? page.shapes : []);
+    const exportName = `${safeProjectName} - ${String(i + 1).padStart(2, "0")}_${safePageName}.svg`;
+
+    await drive.files.create({
+      requestBody: {
+        name: exportName,
+        parents: [folderId],
+        mimeType: "image/svg+xml",
+      },
+      media: {
+        mimeType: "image/svg+xml",
+        body: svg,
+      },
+      fields: "id",
+    });
+  }
+
+  await sql`
+    UPDATE drive_project_links
+    SET
+      drive_folder_id = ${folderId},
+      drive_file_id = NULL,
+      access_token = COALESCE(${oauth.credentials.access_token || null}, access_token),
+      refresh_token = COALESCE(${oauth.credentials.refresh_token || null}, refresh_token),
+      expiry_date = COALESCE(${oauth.credentials.expiry_date || null}, expiry_date),
+      scope = COALESCE(${oauth.credentials.scope || null}, scope),
+      updated_at = NOW()
+    WHERE id = ${link.id}
+  `;
+}
+
+async function deleteDriveMirrorForLink(link) {
+  if (!link.drive_folder_id && !link.drive_file_id) return;
+  const oauth = createDriveOAuthClient();
+  oauth.setCredentials({
+    access_token: link.access_token,
+    refresh_token: link.refresh_token,
+    expiry_date: link.expiry_date ? Number(link.expiry_date) : undefined,
+    scope: link.scope || undefined,
+  });
+  const drive = google.drive({ version: "v3", auth: oauth });
+  if (link.drive_folder_id) {
+    await drive.files.delete({ fileId: link.drive_folder_id });
+    return;
+  }
+  await drive.files.delete({ fileId: link.drive_file_id });
+}
+
+function scheduleProjectDriveSync(projectId) {
+  if (!isDriveConfigured()) return;
+  const key = String(projectId);
+  clearTimeout(driveSyncTimers[key]);
+  driveSyncTimers[key] = setTimeout(async () => {
+    if (driveSyncRunning[key]) return;
+    driveSyncRunning[key] = true;
+    try {
+      const snapshot = await loadProjectSnapshot(projectId);
+      if (!snapshot) return;
+      const links = await getDriveLinksForProject(projectId);
+      for (const link of links) {
+        try {
+          await ensureDriveMirrorForLink(link, snapshot);
+          await persistDriveLinkStatus(link.id, { synced: true, error: null });
+        } catch (err) {
+          await persistDriveLinkStatus(link.id, { synced: false, error: err.message || "Drive sync failed" });
+          console.error("Drive sync error:", err);
+        }
+      }
+    } finally {
+      driveSyncRunning[key] = false;
+    }
+  }, 1200);
+}
+
 async function flushFileSnapshot(fileId) {
   const shapes = Array.isArray(fileStates[fileId]) ? fileStates[fileId] : null;
   if (!shapes) return;
@@ -222,6 +550,8 @@ async function flushFileSnapshot(fileId) {
       SET shapes = ${JSON.stringify(shapes)}::jsonb
       WHERE id = ${fileId}
     `;
+    const projectId = await getProjectIdForFile(fileId);
+    if (projectId) scheduleProjectDriveSync(projectId);
   } catch (err) {
     console.error("Snapshot flush error:", err);
   }
@@ -238,6 +568,8 @@ function scheduleSaveFileSnapshot({ fileId, shapes }) {
         SET shapes = ${JSON.stringify(shapes)}::jsonb
         WHERE id = ${fileId}
       `;
+      const projectId = await getProjectIdForFile(fileId);
+      if (projectId) scheduleProjectDriveSync(projectId);
     } catch (err) {
       console.error("Snapshot save error:", err);
     }
@@ -391,6 +723,201 @@ app.get("/templates", verifyToken, async (_req, res) => {
   );
 });
 
+app.get("/integrations/google-drive/status/:projectId", verifyToken, async (req, res) => {
+  if (!isDriveConfigured()) {
+    return res.json({ configured: false, linked: false });
+  }
+  const projectId = req.params.projectId;
+  const userId = req.user.userId;
+  try {
+    const loaded = await loadProjectForUser({ projectId, userId });
+    if (!loaded) return res.status(404).json({ error: "Project not found" });
+    const rows = await sql`
+      SELECT google_email, drive_folder_id, last_synced_at, last_error
+      FROM drive_project_links
+      WHERE project_id = ${projectId} AND user_id = ${userId}
+      LIMIT 1
+    `;
+    if (!rows.length) {
+      return res.json({ configured: true, linked: false });
+    }
+    return res.json({
+      configured: true,
+      linked: true,
+      googleEmail: rows[0].google_email,
+      hasDriveFolder: Boolean(rows[0].drive_folder_id),
+      lastSyncedAt: rows[0].last_synced_at,
+      lastError: rows[0].last_error,
+    });
+  } catch (err) {
+    console.error("Drive status error:", err);
+    res.status(500).json({ error: "Failed to load Drive status" });
+  }
+});
+
+app.post("/integrations/google-drive/auth-url", verifyToken, async (req, res) => {
+  if (!isDriveConfigured()) {
+    return res.status(500).json({ error: "Google Drive integration is not configured" });
+  }
+  const projectId = String(req.body?.projectId || "").trim();
+  const userId = req.user.userId;
+  if (!projectId) return res.status(400).json({ error: "Missing projectId" });
+  try {
+    const loaded = await loadProjectForUser({ projectId, userId });
+    if (!loaded) return res.status(404).json({ error: "Project not found" });
+    const oauth = createDriveOAuthClient();
+    const state = uuidv4();
+    driveOauthStates[state] = {
+      userId: String(userId),
+      projectId: String(projectId),
+      expiresAt: Date.now() + 10 * 60 * 1000,
+    };
+    const authUrl = oauth.generateAuthUrl({
+      access_type: "offline",
+      prompt: "consent",
+      scope: DRIVE_SCOPES,
+      state,
+    });
+    res.json({ authUrl });
+  } catch (err) {
+    console.error("Drive auth-url error:", err);
+    res.status(500).json({ error: "Failed to start Google Drive auth" });
+  }
+});
+
+app.get("/integrations/google-drive/callback", async (req, res) => {
+  const state = String(req.query?.state || "");
+  const code = String(req.query?.code || "");
+  const error = String(req.query?.error || "");
+  const stateEntry = driveOauthStates[state];
+
+  function htmlResult(success, message) {
+    const payload = JSON.stringify({ source: "collabra-drive-oauth", success, message });
+    return `<!doctype html><html><body><script>
+      (function() {
+        const payload = ${payload};
+        if (window.opener) window.opener.postMessage(payload, "*");
+        window.close();
+      })();
+    </script><p>${message}</p></body></html>`;
+  }
+
+  if (!stateEntry || stateEntry.expiresAt < Date.now()) {
+    delete driveOauthStates[state];
+    return res.status(400).send(htmlResult(false, "Drive link request expired. Please try again."));
+  }
+  delete driveOauthStates[state];
+
+  if (error) {
+    return res.status(400).send(htmlResult(false, `Google denied access: ${error}`));
+  }
+  if (!code) {
+    return res.status(400).send(htmlResult(false, "Missing authorization code from Google."));
+  }
+
+  try {
+    const oauth = createDriveOAuthClient();
+    const { tokens: driveTokens } = await oauth.getToken(code);
+    oauth.setCredentials(driveTokens);
+    const oauth2Api = google.oauth2({ version: "v2", auth: oauth });
+    const profile = await oauth2Api.userinfo.get();
+    const email = String(profile?.data?.email || "").toLowerCase();
+    if (!email) throw new Error("Google account email unavailable");
+
+    const existing = await sql`
+      SELECT id
+      FROM drive_project_links
+      WHERE project_id = ${stateEntry.projectId} AND user_id = ${stateEntry.userId}
+      LIMIT 1
+    `;
+
+    let linkId = null;
+    if (existing.length) {
+      linkId = existing[0].id;
+      await sql`
+        UPDATE drive_project_links
+        SET
+          google_email = ${email},
+          access_token = ${driveTokens.access_token || null},
+          refresh_token = COALESCE(${driveTokens.refresh_token || null}, refresh_token),
+          scope = ${driveTokens.scope || null},
+          expiry_date = ${driveTokens.expiry_date || null},
+          updated_at = NOW(),
+          last_error = NULL
+        WHERE id = ${linkId}
+      `;
+    } else {
+      const inserted = await sql`
+        INSERT INTO drive_project_links (
+          project_id, user_id, google_email, access_token, refresh_token, scope, expiry_date
+        )
+        VALUES (
+          ${stateEntry.projectId},
+          ${stateEntry.userId},
+          ${email},
+          ${driveTokens.access_token || null},
+          ${driveTokens.refresh_token || null},
+          ${driveTokens.scope || null},
+          ${driveTokens.expiry_date || null}
+        )
+        RETURNING id
+      `;
+      linkId = inserted[0].id;
+    }
+
+    await persistDriveCredentials(linkId, oauth.credentials);
+    scheduleProjectDriveSync(stateEntry.projectId);
+    return res.send(htmlResult(true, "Google Drive connected. You can close this window."));
+  } catch (err) {
+    console.error("Drive callback error:", err);
+    return res.status(500).send(htmlResult(false, "Failed to complete Google Drive connection."));
+  }
+});
+
+app.post("/integrations/google-drive/sync/:projectId", verifyToken, async (req, res) => {
+  if (!isDriveConfigured()) {
+    return res.status(500).json({ error: "Google Drive integration is not configured" });
+  }
+  const projectId = req.params.projectId;
+  const userId = req.user.userId;
+  try {
+    const loaded = await loadProjectForUser({ projectId, userId });
+    if (!loaded) return res.status(404).json({ error: "Project not found" });
+    const link = await sql`
+      SELECT *
+      FROM drive_project_links
+      WHERE project_id = ${projectId} AND user_id = ${userId}
+      LIMIT 1
+    `;
+    if (!link.length) return res.status(404).json({ error: "Google Drive is not connected for this project" });
+    const snapshot = await loadProjectSnapshot(projectId);
+    if (!snapshot) return res.status(404).json({ error: "Project not found" });
+    await ensureDriveMirrorForLink(link[0], snapshot);
+    await persistDriveLinkStatus(link[0].id, { synced: true, error: null });
+    res.json({ ok: true });
+  } catch (err) {
+    console.error("Drive manual sync error:", err);
+    res.status(500).json({ error: "Failed to sync to Google Drive" });
+  }
+});
+
+app.delete("/integrations/google-drive/:projectId", verifyToken, async (req, res) => {
+  const projectId = req.params.projectId;
+  const userId = req.user.userId;
+  try {
+    const loaded = await loadProjectForUser({ projectId, userId });
+    if (!loaded) return res.status(404).json({ error: "Project not found" });
+    await sql`
+      DELETE FROM drive_project_links
+      WHERE project_id = ${projectId} AND user_id = ${userId}
+    `;
+    res.json({ ok: true });
+  } catch (err) {
+    console.error("Drive disconnect error:", err);
+    res.status(500).json({ error: "Failed to disconnect Google Drive" });
+  }
+});
+
 // Project endpoints
 app.get("/projects", verifyToken, async (req, res) => {
   const userId = req.user.userId;
@@ -458,6 +985,7 @@ app.post("/projects", verifyToken, async (req, res) => {
     const owner = await sql`SELECT display_name FROM users WHERE id = ${ownerId} LIMIT 1`;
     const files = {};
     for (const f of insertedFiles) {
+      fileProjectMap[f.id] = project[0].id;
       files[f.id] = {
         id: f.id,
         name: f.name,
@@ -509,6 +1037,7 @@ app.patch("/projects/:projectId", verifyToken, async (req, res) => {
       WHERE id = ${projectId}
       RETURNING id, name
     `;
+    scheduleProjectDriveSync(projectId);
     res.json({ id: updated[0].id, name: updated[0].name });
   } catch (err) {
     console.error("Rename project error:", err);
@@ -650,6 +1179,19 @@ app.delete("/projects/:projectId", verifyToken, async (req, res) => {
     if (!p.length) return res.status(404).json({ error: "Project not found" });
     if (String(p[0].owner_id) !== String(ownerId)) return res.status(403).json({ error: "Owner only" });
 
+    if (isDriveConfigured()) {
+      const links = await getDriveLinksForProject(projectId);
+      for (const link of links) {
+        try {
+          await deleteDriveMirrorForLink(link);
+        } catch (err) {
+          console.error("Drive delete mirror error:", err);
+        }
+      }
+    }
+
+    const fileRows = await sql`SELECT id FROM project_files WHERE project_id = ${projectId}`;
+    for (const f of fileRows) delete fileProjectMap[f.id];
     await sql`DELETE FROM projects WHERE id = ${projectId}`;
     res.json({ ok: true });
   } catch (err) {
@@ -817,7 +1359,9 @@ io.on("connection", (socket) => {
         VALUES (${session.projectId}, ${name}, '[]'::jsonb)
         RETURNING id, name
       `;
+      fileProjectMap[file[0].id] = session.projectId;
       fileStates[file[0].id] = [];
+      scheduleProjectDriveSync(session.projectId);
       io.to(session.projectId).emit("file_added", { file: { id: file[0].id, name: file[0].name, shapes: [] } });
     } catch (err) {
       console.error("Add file error:", err);
@@ -845,4 +1389,12 @@ io.on("connection", (socket) => {
 });
 
 // Listen on all interfaces so other devices on LAN can connect.
+ensureDriveIntegrationSchema()
+  .then(() => {
+    console.log("[drive] integration schema ready");
+  })
+  .catch((err) => {
+    console.error("[drive] schema init failed:", err);
+  });
+
 server.listen(3001, "0.0.0.0", () => console.log("Server on http://localhost:3001"));

@@ -21,6 +21,7 @@ export default function Editor({ user, project: initialProject, onBack }) {
   const [membersOpen, setMembersOpen]   = useState(false);
   const [acquiring, setAcquiring]       = useState(false);
   const [rtStatus, setRtStatus]         = useState({ connected: socket.connected, err: "" });
+  const [driveStatus, setDriveStatus]   = useState({ configured: false, linked: false, loading: false, syncing: false, googleEmail: "", lastError: "" });
   const toastId    = useRef(0);
   const historyRef = useRef({}); // { [fileId]: { past[], future[] } }
   const joinedRef  = useRef(false);
@@ -38,11 +39,35 @@ export default function Editor({ user, project: initialProject, onBack }) {
     setTimeout(() => setToasts(t => t.filter(x => x.id !== id)), 3500);
   }, []);
 
-  function forceRelogin() {
+  const forceRelogin = useCallback(() => {
     localStorage.removeItem("authToken");
     // Hard reload to re-enter App's auth gate.
     window.location.reload();
-  }
+  }, []);
+
+  const loadDriveStatus = useCallback(async (projectId) => {
+    if (!projectId) return;
+    const token = localStorage.getItem("authToken");
+    setDriveStatus((s) => ({ ...s, loading: true }));
+    try {
+      const res = await fetch(`${API_BASE}/integrations/google-drive/status/${projectId}`, {
+        headers: withApiHeaders({ "Authorization": `Bearer ${token}` }),
+      });
+      if (res.status === 401) { forceRelogin(); return; }
+      const data = await res.json();
+      if (!res.ok) throw new Error(data?.error || "Failed to load Drive status");
+      setDriveStatus((s) => ({
+        ...s,
+        loading: false,
+        configured: Boolean(data.configured),
+        linked: Boolean(data.linked),
+        googleEmail: data.googleEmail || "",
+        lastError: data.lastError || "",
+      }));
+    } catch (err) {
+      setDriveStatus((s) => ({ ...s, loading: false, lastError: err.message || "Drive status unavailable" }));
+    }
+  }, [forceRelogin]);
 
   // ── Socket ────────────────────────────────────────────────────────────────
   useEffect(() => {
@@ -148,7 +173,24 @@ export default function Editor({ user, project: initialProject, onBack }) {
       socket.off("connect", joinOnce);
       socket.off("connect_error");
     };
-  }, [initialProject.id, user.userId, user.userName, toast]);
+  }, [initialProject.id, user.userId, user.userName, toast, forceRelogin]);
+
+  useEffect(() => {
+    if (!project?.id) return;
+    loadDriveStatus(project.id);
+  }, [project?.id, loadDriveStatus]);
+
+  useEffect(() => {
+    function onOAuthMessage(event) {
+      const data = event?.data;
+      if (!data || data.source !== "collabra-drive-oauth") return;
+      if (data.success) toast("Google Drive connected");
+      else toast(data.message || "Google Drive connection failed");
+      if (project?.id) loadDriveStatus(project.id);
+    }
+    window.addEventListener("message", onOAuthMessage);
+    return () => window.removeEventListener("message", onOAuthMessage);
+  }, [project?.id, loadDriveStatus, toast]);
 
   // Join/leave per-file room for watchers + editing status.
   useEffect(() => {
@@ -339,6 +381,69 @@ export default function Editor({ user, project: initialProject, onBack }) {
     e.target.value = "";
   }
 
+  async function connectGoogleDrive() {
+    if (!project?.id) return;
+    const token = localStorage.getItem("authToken");
+    try {
+      const res = await fetch(`${API_BASE}/integrations/google-drive/auth-url`, {
+        method: "POST",
+        headers: withApiHeaders({
+          "Content-Type": "application/json",
+          "Authorization": `Bearer ${token}`,
+        }),
+        body: JSON.stringify({ projectId: project.id }),
+      });
+      if (res.status === 401) { forceRelogin(); return; }
+      const data = await res.json();
+      if (!res.ok) throw new Error(data?.error || "Failed to start Google Drive auth");
+      const popup = window.open(data.authUrl, "collabra-drive-auth", "width=560,height=720");
+      if (!popup) toast("Popup blocked. Allow popups and try again.");
+    } catch (err) {
+      toast(err.message || "Failed to connect Google Drive");
+    }
+  }
+
+  async function syncGoogleDriveNow() {
+    if (!project?.id || !driveStatus.linked) return;
+    const token = localStorage.getItem("authToken");
+    setDriveStatus((s) => ({ ...s, syncing: true }));
+    try {
+      const res = await fetch(`${API_BASE}/integrations/google-drive/sync/${project.id}`, {
+        method: "POST",
+        headers: withApiHeaders({ "Authorization": `Bearer ${token}` }),
+      });
+      if (res.status === 401) { forceRelogin(); return; }
+      const data = await res.json();
+      if (!res.ok) throw new Error(data?.error || "Drive sync failed");
+      toast("Synced to Google Drive");
+      await loadDriveStatus(project.id);
+    } catch (err) {
+      toast(err.message || "Drive sync failed");
+    } finally {
+      setDriveStatus((s) => ({ ...s, syncing: false }));
+    }
+  }
+
+  async function disconnectGoogleDrive() {
+    if (!project?.id || !driveStatus.linked) return;
+    const confirm = window.confirm("Disconnect Google Drive for this project?");
+    if (!confirm) return;
+    const token = localStorage.getItem("authToken");
+    try {
+      const res = await fetch(`${API_BASE}/integrations/google-drive/${project.id}`, {
+        method: "DELETE",
+        headers: withApiHeaders({ "Authorization": `Bearer ${token}` }),
+      });
+      if (res.status === 401) { forceRelogin(); return; }
+      const data = await res.json();
+      if (!res.ok) throw new Error(data?.error || "Failed to disconnect Google Drive");
+      toast("Google Drive disconnected");
+      await loadDriveStatus(project.id);
+    } catch (err) {
+      toast(err.message || "Failed to disconnect Google Drive");
+    }
+  }
+
   // ── Render ────────────────────────────────────────────────────────────────
   if (loadErr) {
     return (
@@ -401,6 +506,19 @@ export default function Editor({ user, project: initialProject, onBack }) {
             <button className="topbar-btn" onClick={() => setMembersOpen(true)}>
               Members
             </button>
+            {driveStatus.configured ? (
+              <>
+                <button className="topbar-btn" onClick={connectGoogleDrive} disabled={driveStatus.loading}>
+                  {driveStatus.linked ? "Reconnect Drive" : "Connect Drive"}
+                </button>
+                <button className="topbar-btn" onClick={syncGoogleDriveNow} disabled={!driveStatus.linked || driveStatus.syncing}>
+                  {driveStatus.syncing ? "Syncing..." : "Sync Drive"}
+                </button>
+                <button className="topbar-btn" onClick={disconnectGoogleDrive} disabled={!driveStatus.linked}>
+                  Disconnect Drive
+                </button>
+              </>
+            ) : null}
             <button className="topbar-btn" onClick={exportCanvas}>Export SVG</button>
             <button className="topbar-btn" onClick={exportProjectPackage}>Export Project</button>
             {!viewOnly && (
@@ -428,6 +546,11 @@ export default function Editor({ user, project: initialProject, onBack }) {
             <span className="collab-pill">
               Realtime: {rtStatus.connected ? "connected" : "offline"}
             </span>
+            {driveStatus.configured && (
+              <span className="collab-pill">
+                Drive: {driveStatus.linked ? `linked (${driveStatus.googleEmail || "account"})` : "not linked"}
+              </span>
+            )}
           </div>
           <div className="collab-right">
             {viewOnly ? (
