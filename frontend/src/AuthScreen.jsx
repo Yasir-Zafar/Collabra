@@ -79,41 +79,49 @@ export default function AuthScreen({ onLogin }) {
   useEffect(() => {
     if (!googleConfigured) return undefined;
     const scriptId = "google-identity-script";
-    let mounted = true;
-
-    async function handleGoogleCredential(credential) {
-      setErr("");
-      setLoading(true);
-      try {
-        const res = await authRequest("/auth/google", { credential });
-        const data = await res.json();
-        if (!res.ok) {
-          setErr(data.error || "Google Sign-in failed");
-          setLoading(false);
-          return;
-        }
-        await finishAuth(data);
-      } catch (e) {
-        setErr("Google Sign-in failed: " + e.message);
-        setLoading(false);
-      }
-    }
+    let timer = null;
 
     function renderGoogleButton() {
-      if (!mounted || !googleButtonRef.current || !window.google?.accounts?.id) return;
-      googleButtonRef.current.innerHTML = "";
-      window.google.accounts.id.initialize({
-        client_id: import.meta.env.VITE_GOOGLE_CLIENT_ID,
-        callback: (response) => handleGoogleCredential(response.credential),
-      });
-      window.google.accounts.id.renderButton(googleButtonRef.current, {
-        type: "standard",
-        shape: "pill",
-        theme: "outline",
-        text: mode === "login" ? "signin_with" : "signup_with",
-        size: "large",
-        width: 280,
-      });
+      const api = window.google?.accounts?.id;
+      if (!api) {
+        timer = setTimeout(renderGoogleButton, 100);
+        return;
+      }
+      try {
+        api.initialize({
+          client_id: import.meta.env.VITE_GOOGLE_CLIENT_ID,
+          callback: async (response) => {
+            setErr("");
+            setLoading(true);
+            try {
+              const res = await authRequest("/auth/google", { credential: response.credential });
+              const data = await res.json();
+              if (!res.ok) {
+                setErr(data.error || "Google Sign-in failed");
+                setLoading(false);
+                return;
+              }
+              await finishAuth(data);
+            } catch (e) {
+              setErr("Google Sign-in failed: " + e.message);
+              setLoading(false);
+            }
+          },
+        });
+      } catch {
+        // Already initialized, continue rendering button
+      }
+      if (googleButtonRef.current) {
+        googleButtonRef.current.innerHTML = "";
+        api.renderButton(googleButtonRef.current, {
+          type: "standard",
+          shape: "pill",
+          theme: "outline",
+          text: mode === "login" ? "signin_with" : "signup_with",
+          size: "large",
+          width: 280,
+        });
+      }
     }
 
     if (!document.getElementById(scriptId)) {
@@ -130,7 +138,7 @@ export default function AuthScreen({ onLogin }) {
     }
 
     return () => {
-      mounted = false;
+      if (timer) clearTimeout(timer);
     };
   }, [googleConfigured, mode]);
 
